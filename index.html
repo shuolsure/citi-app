@@ -5908,6 +5908,315 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
 
 </script>
 <script>
+/* ../miniprogram/engine/idb.js */
+/* =============================================================
+   idb.js · IndexedDB 正文存储（异步）。零依赖，UMD：挂 globalThis.MPIdb。
+
+   为什么要它：localStorage 给每个站点 ~5 MB，而一本 19 MB 的 epub
+   解析出来是 487 万字符、JSON 13.9 MB。**装不下不是慢，是根本进不去。**
+   实测（《光阴之外》1356 章）：解析切章 0.67 秒、起步扫 20 章 0.11 秒 ——
+   CPU 从来不是瓶颈，存储才是。IndexedDB 在 iOS Safari 上的配额是磁盘的
+   一大块（远超 1 GB），二十本大书也放得下。
+
+   它保留 shelf.js 那三条规矩，一条不少 —— 那些规矩是拿 bug 换来的：
+
+     I1 头最后写。中途失败就没有头，等于这本书不存在。
+        半本书比没有书更坏 —— 它能打开，只是后面的章节凭空消失，且不报错。
+     I2 读不齐一律当没有，并就地清理。
+     I3 写不下必须出声（抛 code='quota'、带给读者看的 hint），
+        绝不允许「看起来存上了」。
+
+   和 shelf.js 的两处**有意的不同**：
+
+     A. 按章存，不按字符切片。一章一条记录。
+        localStorage 时代必须把整本序列化成一个字符串再切片，于是有了
+        「不许把代理对切开」那条规矩（切在 U+D800..DBFF 中间，存进去读出来
+        会变成 U+FFFD，而且不报错）。IndexedDB 走结构化克隆，直接存对象，
+        **那一整类坑在这里不存在**。
+        顺带：更新某一章不必重写整本，将来要做「只读当前章」也只是换个读法。
+
+     B. 不 JSON.stringify。结构化克隆更快，也不会因为 JSON 的
+        round-trip 把 undefined / NaN 悄悄改掉。
+
+   ★ 不认识 window.indexedDB —— 工厂对象是传进来的。
+     浏览器传 indexedDB；Node 测试传一份内存实现（见 tests/fake-idb.js）。
+     shelf.js 用 adapter 做同一件事，这里照抄那个思路。
+   ============================================================= */
+(function (root, factory) {
+  const mod = factory();
+  if (typeof module === 'object' && module.exports) module.exports = mod;
+  root.MPIdb = mod;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  const DB_NAME = 'citi';
+  const DB_VER = 1;
+  const STORE = 'blobs';
+  const TX_BATCH = 200;        // 一个事务写多少条。太大有的浏览器会拒，太小白白多开事务
+
+  /** 存不下的时候抛这个。hint 是给读者看的话，不是异常 message。 */
+  function quotaError(what, err) {
+    const e = new Error('idb full: ' + what + (err ? ' / ' + (err.message || err) : ''));
+    e.code = 'quota';
+    e.hint = '手机上给这个程序的存储空间满了。删掉书架上不读的书再试。';
+    return e;
+  }
+
+  function wrapReq(req) {
+    return new Promise(function (resolve, reject) {
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error || new Error('idb request failed')); };
+    });
+  }
+
+  function wrapTx(tx) {
+    return new Promise(function (resolve, reject) {
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function () { reject(tx.error || new Error('idb tx failed')); };
+      tx.onabort = function () { reject(tx.error || new Error('idb tx aborted')); };
+    });
+  }
+
+  /**
+   * 打开数据库。
+   * @param {Object} opts {factory, name, version, prefix}
+   * @returns {Promise<Object>} store
+   */
+  function open(opts) {
+    const o = opts || {};
+    const factory = o.factory || (typeof indexedDB !== 'undefined' ? indexedDB : null);
+    if (!factory) return Promise.reject(new Error('没有 indexedDB，也没传 factory'));
+    const name = o.name || DB_NAME;
+    const prefix = o.prefix == null ? 'mp' : o.prefix;
+
+    const req = factory.open(name, o.version || DB_VER);
+    req.onupgradeneeded = function () {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'k' });
+    };
+    return wrapReq(req).then(function (db) { return createStore(db, prefix); });
+  }
+
+  /* ---------------------------------------------------------------
+     Store
+     --------------------------------------------------------------- */
+  function createStore(db, prefix) {
+    const hkey = (ns, id) => prefix + ':' + ns + ':' + id + '#h';
+    const pkey = (ns, id, i) => prefix + ':' + ns + ':' + id + '#' + i;
+    const bodyPrefix = (ns, id) => prefix + ':' + ns + ':' + id + '#';
+    const nsPrefix = (ns) => prefix + ':' + ns + ':';
+
+    function tx(mode) { return db.transaction(STORE, mode).objectStore(STORE); }
+
+    function getRaw(key) { return wrapReq(tx('readonly').get(key)); }
+
+    /** 某个前缀下的所有 key。IDBKeyRange 的 upper 用 '￿' 收口。 */
+    function keysWithPrefix(pre) {
+      const range = IDBKeyRangeOf(pre);
+      const st = tx('readonly');
+      if (st.getAllKeys) return wrapReq(st.getAllKeys(range));
+      // 没有 getAllKeys 的老实现：游标走一遍
+      return new Promise(function (resolve, reject) {
+        const out = [];
+        const req = st.openKeyCursor(range);
+        req.onsuccess = function () {
+          const c = req.result;
+          if (!c) { resolve(out); return; }
+          out.push(c.key); c.continue();
+        };
+        req.onerror = function () { reject(req.error); };
+      });
+    }
+
+    function IDBKeyRangeOf(pre) {
+      const R = (typeof IDBKeyRange !== 'undefined') ? IDBKeyRange : db._IDBKeyRange;
+      return R.bound(pre, pre + '￿', false, false);
+    }
+
+    function readHeader(ns, id) {
+      return getRaw(hkey(ns, id)).then(function (rec) {
+        if (!rec || !rec.h) return null;
+        const h = rec.h;
+        if (typeof h.n !== 'number' || !h.kind) return null;
+        return h;
+      });
+    }
+
+    /** 删掉一本书的所有记录。多删无所谓，少删会留孤儿。 */
+    function delBody(ns, id) {
+      return keysWithPrefix(bodyPrefix(ns, id)).then(function (keys) {
+        if (!keys.length) return;
+        const st = tx('readwrite');
+        for (const k of keys) st.delete(k);
+        return wrapTx(st.transaction);
+      });
+    }
+
+    /**
+     * 写一本书。
+     * 数组（chapters）→ 一元素一条；其他对象 → 一条。**头最后写**（I1）。
+     * @param {Function} [onProgress] (done, total) 每批调一次，用来画进度条
+     * @throws code='quota'
+     */
+    function putBody(ns, id, obj, onProgress) {
+      const isArr = Array.isArray(obj);
+      const parts = isArr ? obj : [obj];
+      const kind = isArr ? 'array' : 'one';
+
+      return delBody(ns, id).then(function () {
+        // 分批写：一个事务塞 1356 条，有的浏览器会直接拒掉整个事务
+        let i = 0;
+        function batch() {
+          if (i >= parts.length) return Promise.resolve();
+          const st = tx('readwrite');
+          const end = Math.min(parts.length, i + TX_BATCH);
+          for (let j = i; j < end; j++) st.put({ k: pkey(ns, id, j), p: parts[j] });
+          const from = i;
+          i = end;
+          return wrapTx(st.transaction).then(function () {
+            if (onProgress) { try { onProgress(i, parts.length); } catch (e) { /* 画进度条炸了不该连累存书 */ } }
+            void from;
+            return batch();
+          });
+        }
+        return batch();
+      }).then(function () {
+        // ★ 头最后写。到这一步为止，这本书对读取方仍然「不存在」。
+        //   ——但它是**第二道**，不是主防线。实测（突变）：把头改成先写，
+        //   可观测行为一个字不变，因为写失败时下面的 catch 会连头一起回滚掉。
+        //   真正拦住「半本书」的是 finish() 里的条数校验，那一道不能动。
+        //   两道有意重叠，理由和 shelf.js 里「缺片快判 vs 长度校验」一样。
+        const st = tx('readwrite');
+        st.put({ k: hkey(ns, id), h: { n: parts.length, kind: kind, v: 2 } });
+        return wrapTx(st.transaction);
+      }).then(function () {
+        return { chunks: parts.length, chars: -1 };
+      }).catch(function (err) {
+        // 回滚：没有头就等于不存在，但别留一堆孤儿占着配额
+        return delBody(ns, id).catch(function () { /* 回滚尽力而为 */ })
+          .then(function () { throw quotaError(ns + ':' + id, err); });
+      });
+    }
+
+    /**
+     * 读一本书。读不齐一律返回 null 并就地清理（I2）。
+     * @returns {Promise<Object|Array|null>}
+     */
+    function getBody(ns, id) {
+      return readHeader(ns, id).then(function (h) {
+        if (!h) return null;
+        if (h.n === 0) return h.kind === 'array' ? [] : null;
+
+        const st = tx('readonly');
+        const range = IDBKeyRangeOf(bodyPrefix(ns, id));
+        if (!st.getAll) return getBodyByCursor(ns, id, h);
+        return wrapReq(st.getAll(range)).then(function (recs) {
+          // 头也在这个前缀里，挑掉它
+          const parts = [];
+          for (const r of recs) {
+            if (!r || r.k === hkey(ns, id)) continue;
+            const idx = Number(r.k.slice(bodyPrefix(ns, id).length));
+            if (!isFinite(idx)) continue;
+            parts[idx] = r.p;
+          }
+          return finish(ns, id, h, parts);
+        });
+      });
+    }
+
+    function getBodyByCursor(ns, id, h) {
+      const parts = [];
+      let i = 0;
+      function step() {
+        if (i >= h.n) return Promise.resolve(finish(ns, id, h, parts));
+        return getRaw(pkey(ns, id, i)).then(function (rec) {
+          parts[i] = rec ? rec.p : undefined;
+          i += 1;
+          return step();
+        });
+      }
+      return step();
+    }
+
+    /**
+     * ★ 这是不能动的那一道：条数对不上就当没有这本书。
+     *   「少一条」在界面上的表现是某一章凭空空白，而且不报错 ——
+     *   比整本读不出来难发现得多。
+     */
+    function finish(ns, id, h, parts) {
+      let have = 0;
+      for (let i = 0; i < h.n; i++) if (parts[i] !== undefined) have += 1;
+      if (have !== h.n) { delBody(ns, id); return null; }
+      return h.kind === 'array' ? parts.slice(0, h.n) : parts[0];
+    }
+
+    /** 单章读取。现在界面还是整本读回，这个接口是给将来窗口化留的。 */
+    function getChapter(ns, id, i) {
+      return getRaw(pkey(ns, id, i)).then(function (rec) { return rec ? rec.p : null; });
+    }
+
+    function hasBody(ns, id) { return readHeader(ns, id).then(function (h) { return !!h; }); }
+
+    /** 这个命名空间下有哪些 id（只认有头的，孤儿不算） */
+    function listBodies(ns) {
+      return keysWithPrefix(nsPrefix(ns)).then(function (keys) {
+        const out = [];
+        for (const k of keys) {
+          if (k.slice(-2) !== '#h') continue;
+          out.push(k.slice(nsPrefix(ns).length, -2));
+        }
+        return out;
+      });
+    }
+
+    /** 清理孤儿：书架上没有的正文一律删掉。 */
+    function gc(ns, keepIds) {
+      const keep = {};
+      for (const id of (keepIds || [])) keep[id] = 1;
+      return keysWithPrefix(nsPrefix(ns)).then(function (keys) {
+        const dead = {};
+        for (const k of keys) {
+          const rest = k.slice(nsPrefix(ns).length);
+          const hash = rest.lastIndexOf('#');
+          if (hash < 0) continue;
+          const id = rest.slice(0, hash);
+          if (!keep[id]) dead[id] = 1;
+        }
+        const ids = Object.keys(dead);
+        return ids.reduce(function (p, id) {
+          return p.then(function () { return delBody(ns, id); });
+        }, Promise.resolve()).then(function () { return ids; });
+      });
+    }
+
+    /**
+     * 占用估算。
+     * ★ 用 navigator.storage.estimate()，不自己数 —— 数一遍要把所有记录
+     *   读出来，一本书 14 MB，光「看一眼用了多少」就得读 14 MB。
+     */
+    function usage() {
+      if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.estimate) {
+        return navigator.storage.estimate().then(function (e) {
+          return { total: e.usage || 0, quota: e.quota || 0, by: {} };
+        }).catch(function () { return { total: 0, quota: 0, by: {} }; });
+      }
+      return Promise.resolve({ total: 0, quota: 0, by: {} });
+    }
+
+    function close() { try { db.close(); } catch (e) { /* 关不掉就算了 */ } }
+
+    return {
+      putBody: putBody, getBody: getBody, getChapter: getChapter, delBody: delBody,
+      hasBody: hasBody, listBodies: listBodies, gc: gc, usage: usage, close: close,
+      _hkey: hkey, _pkey: pkey,
+    };
+  }
+
+  return { open: open, DB_NAME: DB_NAME, DB_VER: DB_VER, STORE: STORE, TX_BATCH: TX_BATCH };
+});
+
+</script>
+<script>
 /* ../miniprogram/engine/formats/deps.js */
 /* =============================================================
    deps.js · 格式层对主引擎的唯一依赖入口
@@ -7846,22 +8155,125 @@ var OLD_KEY = 'mp-demo-v5';         // 旧版单 blob，启动时迁移一次就
 var storageWarn = null;             // 上次写盘失败的人话；非空时书架顶部挂横幅
 var EV_KEEP = 2000, EV_HIGH = 2400; // 事件流只留最近 2000 条；攒到 2400 才折一次
 
+/* -------------------------------------------------------------
+   书的内容存哪儿（2026-09-13 起）
+   -------------------------------------------------------------
+   localStorage（STORE）：profile / 词状态 / 事件流 / 书架索引 / 检查点。
+     加起来几十 KB，而且词状态每翻一页就要读写 —— 同步接口正合适。
+   IndexedDB（BOOKS）：书头（bidx）、正文（btext）、主理人书库（userlib）。
+     ★ 换过来的理由是实测：一本 19 MB 的 epub 解析出 487 万字符、JSON 13.9 MB，
+       而 localStorage 给整个站点才 ~5 MB。解析只要 0.67 秒（1356 章），
+       **CPU 从来不是瓶颈，存储才是**。
+     ★ 正文搬走之后 localStorage 只剩几十 KB，「一本书撑爆把 profile 一起带走」
+       那个老毛病也跟着没了。
+
+   HEADS / HASTEXT 是内存缓存，启动时从 IDB 一次性载入。
+   ★ 为什么要缓存：发现页在 .map() 回调里挨个取书头，数组回调里没法 await。
+     书头只有几百 KB，全放内存不心疼；正文是按需异步读的，那才是大头。
+   ------------------------------------------------------------- */
+var BOOKS = null;                   // IDB store，openBooks() 之后才有
+var HEADS = {};                     // id → 书头（bidx），内存镜像
+var HASTEXT = {};                   // id → true，这本书的正文在不在
+var idbWarn = null;                 // IDB 打不开时的人话（隐私模式/存储被禁）
+var migrateNote = null;             // 这次启动搬了几本书，搬完提示一次
+
+/* 存储占用。★ 异步取（navigator.storage.estimate），书架渲染是同步的，
+   所以显示的是上一次取到的值 —— 刚导完书会慢一拍，比让整个书架等着强。 */
+var USAGE = { total: 0, quota: 0 };
+function refreshUsage(repaint) {
+  if (!BOOKS) return Promise.resolve();
+  return BOOKS.usage().then(function (u) {
+    USAGE = u;
+    // 当前在哪一屏是靠 DOM 的 .on class，没有 S.screen 这个东西
+    if (repaint && $('s-shelf').classList.contains('on')) paintShelf();
+  }).catch(function () { /* 取不到就还用旧值 */ });
+}
+
+function openBooks() {
+  return MPIdb.open({ prefix: 'mp5' }).then(function (st) {
+    BOOKS = st; idbWarn = null; return st;
+  }).catch(function (e) {
+    /* ★ 打不开也要能读书 —— 降级成「这次不落盘」，绝不白屏。
+       Safari 无痕模式、或者用户在设置里禁了网站数据，都会走到这儿。 */
+    BOOKS = null;
+    idbWarn = '这个浏览器不让存东西（可能是无痕模式）—— 能读，但关掉就没了。';
+    return null;
+  });
+}
+
+/** 把所有书头和「正文在不在」读进内存。启动时一次。 */
+function loadHeads() {
+  if (!BOOKS) return Promise.resolve();
+  return BOOKS.listBodies('bidx').then(function (ids) {
+    return ids.reduce(function (chain, id) {
+      return chain.then(function () {
+        return BOOKS.getBody('bidx', id).then(function (h) { if (h) HEADS[id] = h; });
+      });
+    }, Promise.resolve());
+  }).then(function () {
+    return BOOKS.listBodies('btext');
+  }).then(function (ids) {
+    HASTEXT = {};
+    for (var i = 0; i < ids.length; i++) HASTEXT[ids[i]] = true;
+  });
+}
+
+/**
+ * 一次性搬家：localStorage 里的书 → IndexedDB。
+ * ★ 不是「清掉重来」—— 之前存进去的小书是用户的数据，能搬就搬。
+ *   搬不动的（数据坏了、IDB 写失败）才删，因为留着也只是占那 5 MB。
+ * ★ 顺序必须是「写成了才删旧的」。反过来写，中间失败就是书没了。
+ */
+function migrateBodiesToIdb() {
+  if (!BOOKS) return Promise.resolve({ moved: 0, dropped: 0 });
+  var NS = ['bidx', 'btext', 'userlib'];
+  var moved = 0, dropped = 0;
+  return NS.reduce(function (chain, ns) {
+    return chain.then(function () {
+      var ids;
+      try { ids = STORE.listBodies(ns); } catch (e) { ids = []; }
+      return ids.reduce(function (c2, id) {
+        return c2.then(function () {
+          var body = null;
+          try { body = STORE.getBody(ns, id); } catch (e) { body = null; }
+          if (!body) { try { STORE.delBody(ns, id); } catch (e) {} dropped++; return; }
+          return BOOKS.putBody(ns, id, body).then(function () {
+            try { STORE.delBody(ns, id); } catch (e) { /* 删不掉只是占空间，书已经安全了 */ }
+            moved++;
+          }).catch(function () {
+            /* IDB 也写不下 —— 旧的照样删掉，否则那 5 MB 永远卡着 */
+            try { STORE.delBody(ns, id); } catch (e) {}
+            dropped++;
+          });
+        });
+      }, Promise.resolve());
+    });
+  }, Promise.resolve()).then(function () { return { moved: moved, dropped: dropped }; });
+}
+
 function headOf(book) {
   return { meta: book.meta, index: book.index,
     perChapter: book.perChapter, scannedTo: book.scannedTo };
 }
-/** 取整本（读的时候用） */
+/** 取整本（读的时候用）。★ 异步 —— 正文在 IDB 里。 */
 function getBook(id) {
-  var head = STORE.getBody('bidx', id);
-  var chapters = head && STORE.getBody('btext', id);
-  if (!head || !chapters) { delBook(id); return null; }   // 缺一半 = 没有这本书
-  return { meta: head.meta, chapters: chapters, index: head.index,
-    perChapter: head.perChapter, scannedTo: head.scannedTo };
+  var head = HEADS[id];
+  if (!head || !BOOKS) return Promise.resolve(null);
+  return BOOKS.getBody('btext', id).then(function (chapters) {
+    if (!chapters) { delBook(id); return null; }        // 缺一半 = 没有这本书
+    return { meta: head.meta, chapters: chapters, index: head.index,
+      perChapter: head.perChapter, scannedTo: head.scannedTo };
+  });
 }
-/** 只取头（发现页 / 书架统计用，不碰正文） */
-function getBookHead(id) { return STORE.getBody('bidx', id); }
-function hasBook(id) { return STORE.hasBody('bidx', id) && STORE.hasBody('btext', id); }
-function delBook(id) { STORE.delBody('bidx', id); STORE.delBody('btext', id); }
+/** 只取头（发现页 / 书架统计用，不碰正文）。同步 —— 读内存镜像。 */
+function getBookHead(id) { return HEADS[id] || null; }
+function hasBook(id) { return !!HEADS[id] && !!HASTEXT[id]; }
+function delBook(id) {
+  delete HEADS[id]; delete HASTEXT[id];
+  if (!BOOKS) return Promise.resolve();
+  return Promise.all([BOOKS.delBody('bidx', id), BOOKS.delBody('btext', id)])
+    .catch(function () { /* 删不掉下次 gc 会收 */ });
+}
 /** 把当前进度同步回书架条目（书架排序和「读到第几章」都靠它） */
 function syncShelf() {
   if (!S.book) return;
@@ -7915,45 +8327,65 @@ function save() {
     return false;
   }
 }
-/** 正文 + 索引。只有导入的书要落盘；书库的书正文在包里。 */
-function saveBody(book) {
-  if (!book || book.meta.mode === 'library') return true;
+/**
+ * 正文 + 索引。只有导入的书要落盘；书库的书正文在包里。
+ * ★ 异步（Promise<boolean>）—— 正文进 IndexedDB。
+ * @param {Function} [onProgress] (done,total) 一本 1356 章的书写起来要几秒，
+ *   没有进度条用户只会看见一个不动的转圈，然后以为「一直在解析」。
+ */
+function saveBody(book, onProgress) {
+  if (!book || book.meta.mode === 'library') return Promise.resolve(true);
+  if (!BOOKS) { storageWarn = idbWarn || '存不了。'; return Promise.resolve(false); }
   var id = book.meta.id;
-  try {
-    STORE.putBody('bidx', id, headOf(book));
-    STORE.putBody('btext', id, book.chapters);
-    storageWarn = null; return true;
-  } catch (e) {
-    /* ★ 两半必须同生共死：正文写不下而索引留着，会得到一本「有目录没内容」的书。 */
-    delBook(id);
-    storageWarn = e.hint || '这本书存不下。';
-    return false;
-  }
+  var head = headOf(book);
+  return BOOKS.putBody('btext', id, book.chapters, onProgress)
+    .then(function () { return BOOKS.putBody('bidx', id, head); })
+    .then(function () {
+      HEADS[id] = head; HASTEXT[id] = true;
+      storageWarn = null; refreshUsage(false); return true;
+    })
+    .catch(function (e) {
+      /* ★ 两半必须同生共死：正文写不下而索引留着，会得到一本「有目录没内容」的书。 */
+      return delBook(id).then(function () {
+        storageWarn = e.hint || '这本书存不下。';
+        return false;
+      });
+    });
 }
 /** 只有 index 变了（补扫）：重写头就够，正文一个字没动。 */
 function saveIndexOnly(book) {
-  if (!book || book.meta.mode === 'library') return true;
-  try { STORE.putBody('bidx', book.meta.id, headOf(book)); storageWarn = null; return true; }
-  catch (e) { storageWarn = e.hint || '存不下了。'; return false; }
+  if (!book || book.meta.mode === 'library') return Promise.resolve(true);
+  if (!BOOKS) return Promise.resolve(false);
+  var id = book.meta.id;
+  var head = headOf(book);
+  HEADS[id] = head;                      // 内存先更新：补扫结果立刻要用
+  return BOOKS.putBody('bidx', id, head)
+    .then(function () { storageWarn = null; return true; })
+    .catch(function (e) { storageWarn = e.hint || '存不下了。'; return false; });
 }
 /** 正文变了才调它：导入、补扫、重新分章、入库后换索引 */
-function saveAll() { var a = saveBody(S.book); var b = save(); return a && b; }
+function saveAll(onProgress) {
+  return saveBody(S.book, onProgress).then(function (a) { return a && save(); });
+}
 
 function saveUserLib() {
+  if (!BOOKS) return Promise.resolve(false);
   var okAll = true;
-  S.userLibrary.forEach(function (x) {
-    try { STORE.putBody('userlib', x.id, x); }
-    catch (e) { okAll = false; storageWarn = e.hint || '书库存不下。'; }
-  });
-  STORE.gc('userlib', S.userLibrary.map(function (x) { return x.id; }));
-  return okAll && save();
+  return S.userLibrary.reduce(function (chain, x) {
+    return chain.then(function () {
+      return BOOKS.putBody('userlib', x.id, x)
+        .catch(function (e) { okAll = false; storageWarn = e.hint || '书库存不下。'; });
+    });
+  }, Promise.resolve())
+    .then(function () { return BOOKS.gc('userlib', S.userLibrary.map(function (x) { return x.id; })); })
+    .then(function () { return okAll && save(); });
 }
 
 /** 旧版单 blob → 新分层。只做一次，做完删掉旧 key。 */
 function migrateOld() {
   var raw = null;
-  try { raw = localStorage.getItem(OLD_KEY); } catch (e) { return; }
-  if (!raw) return;
+  try { raw = localStorage.getItem(OLD_KEY); } catch (e) { return Promise.resolve(); }
+  if (!raw) return Promise.resolve();
   try {
     var d = JSON.parse(raw);
     if (d.profile) Object.assign(S.profile, d.profile);
@@ -7963,38 +8395,67 @@ function migrateOld() {
     var books = [];
     if (d.book) books.push(d.book);
     if (d.imported && (!d.book || d.imported.meta.id !== d.book.meta.id)) books.push(d.imported);
+    var chain = Promise.resolve();
     books.forEach(function (bk, i) {
       var e = MPShelf.entryOf(bk, { cover: coverOf(bk) });
       if (i === 0) { e.ch = d.ch || 1; e.gch = d.gch || 1; }
       S.shelf = MPShelf.upsert(S.shelf, e);
-      saveBody(bk);
+      chain = chain.then(function () { return saveBody(bk); });
     });
     if (d.book) { S.book = d.book; S.ch = d.ch || 1; S.gch = d.gch || 1; }
-    saveUserLib();
-    save();
+    return chain.then(saveUserLib).then(save).then(function () {
+      try { localStorage.removeItem(OLD_KEY); } catch (e) { /* 删不掉也不影响 */ }
+    });
   } catch (e) { /* 旧数据坏了就当没有，不能因此打不开 */ }
   try { localStorage.removeItem(OLD_KEY); } catch (e) { /* 删不掉也不影响 */ }
+  return Promise.resolve();
 }
 
+/**
+ * 启动装载。★ 异步 —— 必须先把 IDB 打开、把书头读进内存，才谈得上别的。
+ * @returns {Promise<boolean>} 有没有「当前在读的书」
+ */
 function load() {
-  var d = STORE.getJSON('meta');
-  if (!d) { migrateOld(); return !!S.book; }
-  if (d.profile) Object.assign(S.profile, d.profile);
-  S.userWords = d.userWords || {}; S.events = d.events || [];
-  /* v6 → v7：老数据没有梯子。按 v10 的词状态给个起点（已撤中文的词 → 纯英文），只做这一次。 */
-  S.ladder = d.ladder || MPLadder.seedFromState(S.userWords, ladderOpts());
-  S.rollup = STORE.getBody('roll', 'main') || null;
-  S.shelf = d.shelf || [];
-  S.userLibrary = (d.userLibIds || []).map(function (id) { return STORE.getBody('userlib', id); })
-    .filter(function (x) { return !!x; });
-  /* 孤儿清理：书架上没有的正文一律删掉。 */
-  var mine = S.shelf.filter(function (x) { return x.mode !== 'library'; })
-    .map(function (x) { return x.id; });
-  STORE.gc('bidx', mine); STORE.gc('btext', mine);
-  /* ★ 反向也要清：正文丢了的条目不许留在书架上。 */
-  S.shelf = S.shelf.filter(function (x) { return x.mode === 'library' || hasBook(x.id); });
-  if (d.current) openShelfBook(MPShelf.find(S.shelf, d.current), { silent: true });
-  return !!S.book;
+  return openBooks().then(migrateBodiesToIdb).then(function (mig) {
+    if (mig && (mig.moved || mig.dropped)) {
+      migrateNote = mig.moved + ' 本书已搬进新的存储'
+        + (mig.dropped ? '，' + mig.dropped + ' 本没搬动（重新导入一次就行）' : '');
+    }
+  }).then(loadHeads).then(function () {
+    var d = STORE.getJSON('meta');
+    if (!d) return migrateOld().then(function () { return !!S.book; });
+    if (d.profile) Object.assign(S.profile, d.profile);
+    S.userWords = d.userWords || {}; S.events = d.events || [];
+    /* v6 → v7：老数据没有梯子。按 v10 的词状态给个起点（已撤中文的词 → 纯英文），只做这一次。 */
+    S.ladder = d.ladder || MPLadder.seedFromState(S.userWords, ladderOpts());
+    S.rollup = STORE.getBody('roll', 'main') || null;
+    S.shelf = d.shelf || [];
+
+    /* 主理人书库（userlib）也在 IDB 里，挨个读 */
+    return (d.userLibIds || []).reduce(function (chain, id) {
+      return chain.then(function (acc) {
+        if (!BOOKS) return acc;
+        return BOOKS.getBody('userlib', id).then(function (x) { if (x) acc.push(x); return acc; });
+      });
+    }, Promise.resolve([])).then(function (libs) {
+      S.userLibrary = libs;
+      /* 孤儿清理：书架上没有的正文一律删掉。 */
+      var mine = S.shelf.filter(function (x) { return x.mode !== 'library'; })
+        .map(function (x) { return x.id; });
+      if (!BOOKS) return null;
+      return Promise.all([BOOKS.gc('bidx', mine), BOOKS.gc('btext', mine)]).then(function () {
+        /* gc 可能删掉了东西，内存镜像要跟上 —— 不然书架上会留下点开是空白的条目 */
+        Object.keys(HEADS).forEach(function (id) { if (mine.indexOf(id) < 0) delete HEADS[id]; });
+        Object.keys(HASTEXT).forEach(function (id) { if (mine.indexOf(id) < 0) delete HASTEXT[id]; });
+      });
+    }).then(function () {
+      /* ★ 反向也要清：正文丢了的条目不许留在书架上。 */
+      S.shelf = S.shelf.filter(function (x) { return x.mode === 'library' || hasBook(x.id); });
+      if (!d.current) return false;
+      return Promise.resolve(openShelfBook(MPShelf.find(S.shelf, d.current), { silent: true }))
+        .then(function () { return !!S.book; });
+    });
+  });
 }
 
 /* ---------- 词表（口径 C2：过滤 words 映射，不过滤 bridge） ---------- */
@@ -8212,16 +8673,20 @@ function paintFind() {
 
   var pv = $('find-preview'); pv.innerHTML = '';
   pv.appendChild(el('div', 'kicker', '替换效果'));
-  var src = fullBookOf(list[0]) || LIBRARY[0];
-  var prev = src && MPLib.previewOf({ book: src, words: vw, bridge: BRIDGE, density: 14 });
-  if (prev) {
-    var p = el('div', 'preview');
-    previewInto(p, prev.parts);
-    pv.appendChild(p);
-    pv.appendChild(el('div', 'lbl', '取自《' + src.title + '》第 ' + prev.chapter + ' 章 · 真跑的替换，不是排版稿'));
-  } else {
-    pv.appendChild(el('p', 'empty', '当前词表在这些书里没有命中。'));
-  }
+  /* ★ 正文可能在 IDB 里，取出来要一小会儿 —— 页面别等它，预览晚一帧填进来。
+     这期间 pv 里已经有标题了，不会是一块空白。 */
+  fullBookOf(list[0]).then(function (src0) {
+    var src = src0 || LIBRARY[0];
+    var prev = src && MPLib.previewOf({ book: src, words: vw, bridge: BRIDGE, density: 14 });
+    if (prev) {
+      var p = el('div', 'preview');
+      previewInto(p, prev.parts);
+      pv.appendChild(p);
+      pv.appendChild(el('div', 'lbl', '取自《' + src.title + '》第 ' + prev.chapter + ' 章 · 真跑的替换，不是排版稿'));
+    } else {
+      pv.appendChild(el('p', 'empty', '当前词表在这些书里没有命中。'));
+    }
+  });
 }
 
 /* 发现页顶部。v14：「打开小程序的第一屏永不出现成就提示」—— 这一张卡只有「接着读」，
@@ -8244,16 +8709,22 @@ function paintToday() {
 /* =============================================================
    零·二、书籍详情
    ============================================================= */
+/** ★ 异步 —— 发现页的书是「轻条目」，点进去才从 IDB 取正文。 */
 function fullBookOf(b) {
-  if (!b || !b._light) return b || null;
-  var full = getBook(b.id);
-  if (!full) return null;
-  return Object.assign({}, b, { chapters: full.chapters, index: full.index, _light: false });
+  if (!b || !b._light) return Promise.resolve(b || null);
+  return getBook(b.id).then(function (full) {
+    if (!full) return null;
+    return Object.assign({}, b, { chapters: full.chapters, index: full.index, _light: false });
+  });
 }
 
 function openDetail(b0) {
-  var b = fullBookOf(b0);
-  if (!b) { toast('这本书的正文不在了。'); return; }
+  fullBookOf(b0).then(function (b) {
+    if (!b) { toast('这本书的正文不在了。'); return; }
+    openDetailWith(b);
+  });
+}
+function openDetailWith(b) {
   S.detail = b;
   goto('s-detail');
   var vw = vocabWords();
@@ -8368,29 +8839,32 @@ function openLibraryBook(b) {
 }
 
 /** 打开书架上的一本（正文按需从存储/书库取回来）。 */
+/** ★ 异步 —— 导入的书正文在 IDB 里。返回 Promise<boolean>。 */
 function openShelfBook(entry, o) {
   var opt = o || {};
-  if (!entry) return false;
-  var book = null;
+  if (!entry) return Promise.resolve(false);
+  var got;
   if (entry.mode === 'library') {
     var lib = libEntryById(entry.lib_id || entry.id);
-    if (lib) book = bookFromLibrary(lib);
+    got = Promise.resolve(lib ? bookFromLibrary(lib) : null);
   } else {
-    book = getBook(entry.id);
+    got = getBook(entry.id);
   }
-  if (!book) {
-    /* ★ 不许留一条点开是空白的条目 —— 说清楚并把它从书架上拿掉。 */
-    S.shelf = MPShelf.remove(S.shelf, entry.id);
-    save();
-    if (!opt.silent) { toast('《' + entry.title + '》的正文不在了，已从书架移除。重新导入一次就行。'); paintShelf(); }
-    return false;
-  }
-  S.book = book;
-  S.ch = entry.ch || 1; S.gch = entry.gch || 1;
-  S.history = [];
-  if (S.ch > S.book.chapters.length) S.ch = S.book.chapters.length;
-  if (!opt.silent) { save(); gotoRead(); }
-  return true;
+  return got.then(function (book) {
+    if (!book) {
+      /* ★ 不许留一条点开是空白的条目 —— 说清楚并把它从书架上拿掉。 */
+      S.shelf = MPShelf.remove(S.shelf, entry.id);
+      save();
+      if (!opt.silent) { toast('《' + entry.title + '》的正文不在了，已从书架移除。重新导入一次就行。'); paintShelf(); }
+      return false;
+    }
+    S.book = book;
+    S.ch = entry.ch || 1; S.gch = entry.gch || 1;
+    S.history = [];
+    if (S.ch > S.book.chapters.length) S.ch = S.book.chapters.length;
+    if (!opt.silent) { save(); gotoRead(); }
+    return true;
+  });
 }
 
 /* =============================================================
@@ -8523,8 +8997,10 @@ function paintShelf() {
   var tags = el('div', 'tags');
   tags.appendChild(el('span', 'tag', '共 ' + list.length + ' 本'));
   tags.appendChild(el('span', 'tag plain', '已替换 ' + num(countReplaced()) + ' 词'));
-  var u = STORE.usage();
-  tags.appendChild(el('span', 'tag plain', '占用 ' + (u.total / 1024 / 1024).toFixed(2) + ' MB'));
+  var mb = (USAGE.total || 0) / 1024 / 1024;
+  var qmb = (USAGE.quota || 0) / 1024 / 1024;
+  tags.appendChild(el('span', 'tag plain', '占用 ' + (mb < 0.01 ? '<0.01' : mb.toFixed(2)) + ' MB'
+    + (qmb > 1 ? ' / 可用 ' + (qmb > 1024 ? (qmb / 1024).toFixed(1) + ' GB' : qmb.toFixed(0) + ' MB') : '')));
   b.appendChild(tags);
 
   var main = el('div', 'card');
@@ -8552,8 +9028,12 @@ function paintShelf() {
     var pub = el('button', 'btn ghost');
     pub.appendChild(svg('upload')); pub.appendChild(el('span', null, '把这本加入书库'));
     pub.onclick = function () {
-      if (!openShelfBook(cur, { silent: true })) return;
-      openPublish(S.book);
+      /* ★ 必须等它加载完 —— openShelfBook 现在返回 Promise，
+         写成 if(!openShelfBook(...)) 会恒为 false 一路放行，
+         然后把上一本书（或 null）交给 openPublish，而且不报错。 */
+      openShelfBook(cur, { silent: true }).then(function (ok) {
+        if (ok) openPublish(S.book);
+      });
     };
     main.appendChild(pub);
   }
@@ -8683,25 +9163,43 @@ function acceptBook(bk, extra) {
   S.book = book; S.history = [];
 
   var entry = MPShelf.entryOf(book, { cover: e.cover || coverOf(book), author: e.author });
-  if (!saveBody(book)) {
-    S.ch = 1; S.gch = 1;
-    checkList((e.checks || []).concat([[storageWarn || '存不下了。', 'bad']]));
-    goto('s-import'); $('phone').classList.add('wizard');
-    show($('step1'), false); show($('step2'), true); show($('imp-rescue'), true);
-    return;
-  }
-  S.shelf = MPShelf.upsert(S.shelf, entry);
-  var saved = MPShelf.find(S.shelf, book.meta.id);
-  S.ch = saved.ch || 1; S.gch = saved.gch || 1;
-  emit({ kind: 'import', value: book.meta.chapters });
-  save();
+  var base = (e.checks || []);
 
-  var cov = MPImport.coverageOf(book.index, vocabWords(),
-    { firstChapters: 10, scannedTo: book.scannedTo, total: book.chapters.length });
-  goto('s-shelf');
-  toast('《' + book.meta.title + '》已放进书架 · ' + book.meta.chapters + ' 章 · 能教你 '
-    + num(cov.words) + ' 个' + S.profile.vocab_preset + '词'
-    + (saved.ch > 1 ? '\n上次读到第 ' + saved.ch + ' 章，点开就接着读。' : ''));
+  /* ★ 保存是有耗时的一步（1356 章的书要写几秒），必须让它看得见。
+     没有进度的时候用户看到的是一个不动的转圈 —— 然后以为「一直在解析」，
+     实际上解析 0.67 秒就完了，卡的是写盘。 */
+  var total = book.chapters.length;
+  checkList(base.concat([['正在保存 0/' + total + ' 章', 'run']]));
+  var lastPaint = 0;
+  function onProgress(done, n) {
+    /* 每 200ms 画一次就够 —— 每批都重绘 DOM 反而拖慢保存本身 */
+    var now = Date.now();
+    if (done < n && now - lastPaint < 200) return;
+    lastPaint = now;
+    checkList(base.concat([['正在保存 ' + done + '/' + n + ' 章', done >= n ? 'ok' : 'run']]));
+  }
+
+  saveBody(book, onProgress).then(function (okSave) {
+    if (!okSave) {
+      S.ch = 1; S.gch = 1;
+      checkList(base.concat([[storageWarn || '存不下了。', 'bad']]));
+      goto('s-import'); $('phone').classList.add('wizard');
+      show($('step1'), false); show($('step2'), true); show($('imp-rescue'), true);
+      return;
+    }
+    S.shelf = MPShelf.upsert(S.shelf, entry);
+    var saved = MPShelf.find(S.shelf, book.meta.id);
+    S.ch = saved.ch || 1; S.gch = saved.gch || 1;
+    emit({ kind: 'import', value: book.meta.chapters });
+    save();
+
+    var cov = MPImport.coverageOf(book.index, vocabWords(),
+      { firstChapters: 10, scannedTo: book.scannedTo, total: book.chapters.length });
+    goto('s-shelf');
+    toast('《' + book.meta.title + '》已放进书架 · ' + book.meta.chapters + ' 章 · 能教你 '
+      + num(cov.words) + ' 个' + S.profile.vocab_preset + '词'
+      + (saved.ch > 1 ? '\n上次读到第 ' + saved.ch + ' 章，点开就接着读。' : ''));
+  });
 }
 
 function importFrom(input, opts) {
@@ -10620,10 +11118,18 @@ applyTheme();
      在读一本 → 直接回那一章（冷启动的这一屏不许出现成就提示：会话挂 firstScreen，读者动一下才摘）
      书架上有书但没在读 → 回书架
      全空 + 没走过首次进入 → 首次进入五屏 */
-if (load() && S.book) { beginSession({ launch: true }); goto('s-read'); renderChapter(); }
-else if (S.shelf.length) { goto('s-shelf'); }
-else if (!S.profile.onboarded && LIBRARY.length) { openWelcome(); }
-else { goto('s-find'); }
+/* ★ 启动要等 IDB 打开 + 书头载入。load() 现在是 Promise，
+   写成 if (load() && S.book) 会恒真（Promise 是 truthy），
+   然后拿一个还没装载的 S.book 去渲染 —— 白屏，且不报错。 */
+load().then(function (hasBook) {
+  if (hasBook && S.book) { beginSession({ launch: true }); goto('s-read'); renderChapter(); }
+  else if (S.shelf.length) { goto('s-shelf'); }
+  else if (!S.profile.onboarded && LIBRARY.length) { openWelcome(); }
+  else { goto('s-find'); }
+  if (idbWarn) toast(idbWarn);
+  else if (migrateNote) toast(migrateNote);
+  refreshUsage(true);
+});
 })();
 
 </script>
