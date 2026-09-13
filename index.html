@@ -658,6 +658,7 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
 <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5l10 -10"/></symbol>
 <symbol id="i-set" viewBox="0 0 24 24"><path d="M4 10a2 2 0 1 0 4 0a2 2 0 0 0 -4 0"/><path d="M6 4v4"/><path d="M6 12v8"/><path d="M16 16a2 2 0 1 0 4 0a2 2 0 0 0 -4 0"/><path d="M18 4v10"/><path d="M18 18v2"/></symbol>
 <symbol id="i-upload" viewBox="0 0 24 24"><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2"/><path d="M7 9l5 -5l5 5"/><path d="M12 4v12"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2"/><path d="M7 11l5 5l5 -5"/><path d="M12 4v12"/></symbol>
 <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z"/><path d="M9 13h6"/><path d="M9 17h6"/></symbol>
 <symbol id="i-clip" viewBox="0 0 24 24"><path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2"/><path d="M9 3m0 2a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v0a2 2 0 0 1 -2 2h-2a2 2 0 0 1 -2 -2z"/><path d="M9 12h6"/><path d="M9 16h6"/></symbol>
 <symbol id="i-open" viewBox="0 0 24 24"><path d="M3 19a9 9 0 0 1 9 0a9 9 0 0 1 9 0"/><path d="M3 6a9 9 0 0 1 9 0a9 9 0 0 1 9 0"/><path d="M3 6v13"/><path d="M12 6v13"/><path d="M21 6v13"/></symbol>
@@ -733,6 +734,7 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
              反正 sniff.js 看的是文件头不是扩展名，accept 只能筛选择框、拦不住任何东西，
              选错了会得到一句人话。宁可让人选得到，也不要让人选不中。 -->
         <input type="file" id="file-input" hidden>
+  <input type="file" id="backup-input" hidden>
         <div class="src" data-src="paste">
           <svg class="ic on"><use href="#i-clip"/></svg>
           <div class="txt"><b>粘贴一段文字</b><span>手边没有文件就用这个</span></div>
@@ -5839,6 +5841,53 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
     return [merged].concat(rest).slice(0, SHELF_MAX);
   }
 
+  /**
+   * 按书名认领书架上已有的条目。
+   *
+   * ★ 为什么要它：书的 id 是导入那一刻的时间戳，所以同一本书在两台设备上
+   *   id 不同。换设备时如果只带了「学习记录」（不含正文的轻档），
+   *   新设备重新导入原文件会生成新 id —— 书架上多一条从头开始的书，
+   *   而旧条目上那「读到第 1024 章」永远接不上，**而且不报错**。
+   *   认领之后 upsert 会把 ch/gch 保留下来，进度就接上了。
+   *
+   * ★ 顺带治了另一个毛病：重复导入同一本书会在书架上堆两条。
+   *
+   * @param {Array} shelf
+   * @param {String} title 新导入这本书的书名
+   * @returns {Object|null} 认领到的条目
+   */
+  function claimByTitle(shelf, title) {
+    const t = String(title == null ? '' : title).trim();
+    if (!t) return null;
+    /* 书库的书不认领 —— 它们的 id 是书库给的，正文也在包里，没有「接不上」的问题 */
+    const cands = (shelf || []).filter((x) => x && x.mode !== 'library' && String(x.title).trim() === t);
+    if (!cands.length) return null;
+    /* 多条同名时取读得最远的那条 —— 认错了顶多少接一点进度，
+       认到一条没读过的就白费了 */
+    return cands.slice().sort((a, b) => (b.ch || 1) - (a.ch || 1))[0];
+  }
+
+  /**
+   * 这条书架条目该不该留着。
+   *
+   * ★ 原来的规则是「没有正文就删掉」—— 防的是「点开是一页空白」那种坏条目。
+   *   但存档功能来了之后，「没有正文」多了一种**合法**情况：
+   *   只带学习记录的轻档恢复过来，书架上有条目、正文还没导入。
+   *   照老规则一删，用户就再也没机会「重新导入原文件把进度接上」了 ——
+   *   而且是在下一次保存时静默发生的，书架看着好好的，一操作就空了。
+   *
+   *   所以区分两者的不是「有没有正文」，是**这条目知不知道自己在等正文**（need_text）。
+   *
+   * @param {Object} entry
+   * @param {Object} haveText {id:true}
+   */
+  function keepable(entry, haveText) {
+    if (!entry) return false;
+    if (entry.mode === 'library') return true;          // 书库的书正文在包里
+    if ((haveText || {})[entry.id]) return true;        // 正文在本机
+    return !!entry.need_text;                           // 在等用户重新导入
+  }
+
   function remove(shelf, id) { return (shelf || []).filter((x) => x.id !== id); }
 
   function find(shelf, id) { return (shelf || []).filter((x) => x.id === id)[0] || null; }
@@ -5903,7 +5952,7 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
     CHUNK: CHUNK, SHELF_MAX: SHELF_MAX,
     chunk: chunk, createStore: createStore,
     webAdapter: webAdapter, memAdapter: memAdapter,
-    entryOf: entryOf, upsert: upsert, remove: remove, find: find,
+    entryOf: entryOf, upsert: upsert, remove: remove, find: find, claimByTitle: claimByTitle, keepable: keepable,
     touch: touch, sorted: sorted, progress: progress,
   };
 });
@@ -6336,6 +6385,152 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
   }
 
   return { search: search, norm: norm, allChars: allChars, subseq: subseq, LIMIT: LIMIT };
+});
+
+</script>
+<script>
+/* ../miniprogram/engine/backup.js */
+/* =============================================================
+   backup.js · 存档导出 / 导入（纯逻辑，Node 可测）。零依赖，UMD：挂 globalThis.MPBackup。
+
+   为什么要它：阅读记录、词状态、书全在这台设备的 IndexedDB 里。
+   删掉主屏图标、换手机、清一次网站数据 —— 几个月的进度就没了，
+   而且没有任何地方能找回来。
+
+   两种档：
+     full   含正文。换设备一步到位，20 MB 上下。
+     light  只有学习记录（profile / 词状态 / 梯子 / 事件 / 书架），几百 KB。
+            ★ 书的 id 是导入那一刻的时间戳，所以同一本书在两台设备上
+              id 不同 —— 轻档恢复后书架条目是「有条目没正文」的。
+              这不是 bug，但必须让用户看见（reattach 标记）。
+
+   ★ 这个文件只负责「打包」和「验包」，不碰存储。
+     真正的写入顺序在 app.js：**正文先写，meta 最后写**。
+     反过来的话，中途失败会得到「书架上有条目、正文不存在」，
+     load() 会把条目清掉 —— 用户看到的是「书丢了」，比没导入更坏。
+   ============================================================= */
+(function (root, factory) {
+  const mod = factory();
+  if (typeof module === 'object' && module.exports) module.exports = mod;
+  root.MPBackup = mod;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  const FORMAT = 'citi-backup';
+  const VERSION = 1;
+  const META_V = 7;              // app 那边 meta 的版本，导入时用来判能不能认
+
+  function pad(n) { return n < 10 ? '0' + n : String(n); }
+
+  /** 文件名带日期和书数，用户在「文件」App 里一眼能分清哪个是哪个 */
+  function filename(stats, now) {
+    const d = now ? new Date(now) : new Date();
+    const day = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate());
+    const kind = (stats && stats.kind) === 'light' ? '学习记录' : '完整备份';
+    const n = (stats && stats.books) || 0;
+    return '词替-' + kind + '-' + day + (n ? '-' + n + '本' : '') + '.json';
+  }
+
+  /**
+   * 打包。
+   * @param {Object} input {meta, roll, books:[{id, head, chapters}], userlib:[], kind}
+   * @returns {Object} 可以直接 JSON.stringify 的对象
+   */
+  function build(input) {
+    const i = input || {};
+    const books = i.books || [];
+    const kind = i.kind === 'light' ? 'light' : 'full';
+    return {
+      format: FORMAT,
+      version: VERSION,
+      kind: kind,
+      at: i.at || Date.now(),
+      stats: {
+        kind: kind,
+        books: books.length,
+        chapters: books.reduce(function (a, b) { return a + ((b.chapters || []).length); }, 0),
+        words: Object.keys((i.meta && i.meta.userWords) || {}).length,
+        events: ((i.meta && i.meta.events) || []).length,
+      },
+      meta: i.meta || null,
+      roll: i.roll || null,
+      userlib: i.userlib || [],
+      books: kind === 'light'
+        ? books.map(function (b) { return { id: b.id, head: b.head, chapters: null }; })
+        : books,
+    };
+  }
+
+  /**
+   * 验包。★ 这是导入的唯一闸门 —— 它说 ok 之前，调用方一个字节都不许写。
+   * @returns {Object} {ok, why, stats, kind}
+   */
+  function validate(obj) {
+    const bad = function (why) { return { ok: false, why: why, stats: null }; };
+    if (!obj || typeof obj !== 'object') return bad('这不是一个存档文件。');
+    if (obj.format !== FORMAT) return bad('这不是「词替」的存档文件。');
+    if (typeof obj.version !== 'number' || obj.version > VERSION) {
+      return bad('这个存档来自更新的版本（v' + obj.version + '），当前版本读不了。先把 App 更新一下。');
+    }
+    if (!obj.meta || typeof obj.meta !== 'object') return bad('存档里没有学习记录，可能已经损坏。');
+    if (obj.meta.v != null && obj.meta.v > META_V) {
+      return bad('存档里的记录格式比当前版本新，读不了。');
+    }
+    if (!Array.isArray(obj.meta.shelf)) return bad('存档里的书架坏了。');
+    if (!Array.isArray(obj.books)) return bad('存档里的书目坏了。');
+
+    /* 每本书自己要自洽。★ 半本书比没有书更坏 —— 宁可整包拒了，
+       也不要导进去一本「有目录、翻到第 N 章空白」的书。 */
+    for (let k = 0; k < obj.books.length; k++) {
+      const b = obj.books[k];
+      if (!b || !b.id) return bad('存档里第 ' + (k + 1) + ' 本书没有编号，已损坏。');
+      if (!b.head || !b.head.meta) return bad('《' + (b.id) + '》的信息不全，已损坏。');
+      if (obj.kind === 'full') {
+        if (!Array.isArray(b.chapters)) return bad('《' + (b.head.meta.title || b.id) + '》没有正文，存档不完整。');
+        const want = b.head.meta.chapters;
+        if (typeof want === 'number' && want !== b.chapters.length) {
+          return bad('《' + (b.head.meta.title || b.id) + '》的章数对不上（记的 ' + want
+            + ' 章，实际 ' + b.chapters.length + ' 章），存档已损坏。');
+        }
+      }
+    }
+    const kind = obj.kind === 'light' ? 'light' : 'full';
+    return {
+      ok: true, why: null, kind: kind,
+      stats: obj.stats || { kind: kind, books: obj.books.length, chapters: 0, words: 0, events: 0 },
+    };
+  }
+
+  /**
+   * 轻档导入后，哪些书是「有条目没正文」的。
+   * @param {Array} shelf 存档里的书架
+   * @param {Object} haveText {id:true} 本机已有正文的书
+   * @returns {Array} 需要重新导入原文件的条目
+   */
+  function needReattach(shelf, haveText) {
+    const have = haveText || {};
+    return (shelf || []).filter(function (x) {
+      return x && x.mode !== 'library' && !have[x.id];
+    });
+  }
+
+  /** 人话的一句话摘要，给确认框用 */
+  function summary(stats) {
+    if (!stats) return '';
+    const parts = [];
+    if (stats.books) parts.push(stats.books + ' 本书');
+    if (stats.chapters) parts.push(stats.chapters + ' 章正文');
+    if (stats.words) parts.push(stats.words + ' 个词的学习记录');
+    if (stats.events) parts.push(stats.events + ' 条阅读记录');
+    if (!parts.length) return '一个空存档';
+    return parts.join(' · ');
+  }
+
+  return {
+    FORMAT: FORMAT, VERSION: VERSION, META_V: META_V,
+    build: build, validate: validate, filename: filename,
+    needReattach: needReattach, summary: summary,
+  };
 });
 
 </script>
@@ -8312,6 +8507,214 @@ function refreshUsage(repaint) {
   }).catch(function () { /* 取不到就还用旧值 */ });
 }
 
+/* =============================================================
+   存档：导出 / 导入
+   ============================================================= */
+function bkState(msg) { var e = $('backup-state'); if (e) e.textContent = msg || ''; }
+
+/**
+ * 打包成文件。
+ * ★ 压缩是值得的：实测中文正文 JSON 的 gzip 压缩率约 2.6×，
+ *   62 MB → 24 MB。手机之间 AirDrop 传这个文件，差别是分钟级的。
+ * ★ 但不能强求 —— CompressionStream 要 Safari 16.4+，不支持就照样出 .json。
+ *   导入那边按文件头认（gzip 魔数 1f 8b），两种都吃。
+ */
+function packBackup(obj) {
+  var text = JSON.stringify(obj);
+  var raw = new Blob([text], { type: 'application/json' });
+  if (typeof CompressionStream === 'undefined') return Promise.resolve({ blob: raw, ext: '.json', raw: raw.size });
+  try {
+    return new Response(raw.stream().pipeThrough(new CompressionStream('gzip'))).blob()
+      .then(function (gz) { return { blob: gz, ext: '.citi', raw: raw.size }; })
+      .catch(function () { return { blob: raw, ext: '.json', raw: raw.size }; });
+  } catch (e) { return Promise.resolve({ blob: raw, ext: '.json', raw: raw.size }); }
+}
+
+/** 读回来。按文件头认压缩，不认扩展名 —— 用户可能改过文件名。 */
+function unpackBackup(file) {
+  return file.arrayBuffer().then(function (buf) {
+    var u8 = new Uint8Array(buf);
+    var isGz = u8.length > 2 && u8[0] === 0x1f && u8[1] === 0x8b;
+    if (!isGz) return new TextDecoder('utf-8').decode(u8);
+    if (typeof DecompressionStream === 'undefined') {
+      throw new Error('这个存档是压缩过的，当前浏览器解不开。换个新一点的浏览器试试。');
+    }
+    return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+  });
+}
+
+/**
+ * 导出。full 含正文（20 MB 上下），light 只有学习记录（几百 KB）。
+ * ★ 正文要一本一本从 IDB 读出来，大书要几秒 —— 按钮先变成「正在导出」，
+ *   不然用户会以为没反应，连点几下就是几个 20 MB 的 Blob 同时挂在内存里。
+ */
+function doExport(kind, btn) {
+  if (btn.dataset.busy) return;
+  btn.dataset.busy = '1';
+  var label = btn.lastChild, old = label.textContent;
+  label.textContent = '正在导出…';
+  bkState('');
+
+  var ids = Object.keys(HEADS);
+  var books = [];
+  var chain = Promise.resolve();
+  ids.forEach(function (id, i) {
+    chain = chain.then(function () {
+      bkState('正在读第 ' + (i + 1) + '/' + ids.length + ' 本');
+      if (kind === 'light') { books.push({ id: id, head: HEADS[id], chapters: null }); return; }
+      if (!BOOKS) return;
+      return BOOKS.getBody('btext', id).then(function (chs) {
+        /* 读不出正文的书整本跳过 —— 宁可少导一本，也不要导出一个
+           「有目录、翻到第 N 章空白」的存档（validate 那边也会拦） */
+        if (chs) books.push({ id: id, head: HEADS[id], chapters: chs });
+      });
+    });
+  });
+
+  chain.then(function () {
+    var obj = MPBackup.build({
+      meta: STORE.getJSON('meta'),
+      roll: STORE.getBody('roll', 'main'),
+      userlib: S.userLibrary || [],
+      books: books, kind: kind,
+    });
+    bkState('正在打包…');
+    return packBackup(obj).then(function (pk) {
+      var name = MPBackup.filename(obj.stats).replace(/\.json$/, pk.ext);
+      var url = URL.createObjectURL(pk.blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      /* 立刻 revoke 会让有的浏览器还没开始下载就断了，晚一点收 */
+      setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
+      /* 轻档只有几十 KB，写成「0.0 MB」像是没导出成功 */
+      var sz = function (n) {
+        return n < 1048576 ? (n / 1024).toFixed(0) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+      };
+      bkState('已导出 ' + name + ' · ' + sz(pk.blob.size)
+        + (pk.ext === '.citi' ? '（压缩前 ' + sz(pk.raw) + '）' : '')
+        + ' · ' + MPBackup.summary(obj.stats));
+      toast('存档已导出。在「文件」App 里能找到，AirDrop 给新设备就行。');
+    });
+  }).catch(function (e) {
+    bkState('导出失败：' + (e && e.message ? e.message : '未知原因'));
+  }).then(function () {
+    label.textContent = old; delete btn.dataset.busy;
+  });
+}
+
+/**
+ * 导入。★ 写入顺序：**正文先写，meta 最后写**。
+ * 反过来的话中途失败会得到「书架上有条目、正文不存在」，load() 把条目清掉 ——
+ * 用户看到的是「书丢了」，比没导入更坏。
+ */
+function applyBackup(obj, v) {
+  RESETTING = true;                     // 从这一刻起不许任何常规写盘掺进来
+  var books = obj.books || [];
+  bkState('正在恢复…');
+
+  return (BOOKS ? BOOKS.gc('bidx', []).then(function () { return BOOKS.gc('btext', []); })
+    : Promise.resolve())
+    .then(function () {
+      return books.reduce(function (chain, b, i) {
+        return chain.then(function () {
+          bkState('正在恢复第 ' + (i + 1) + '/' + books.length + ' 本');
+          if (!BOOKS) return;
+          var p = BOOKS.putBody('bidx', b.id, b.head);
+          if (v.kind === 'full' && b.chapters) {
+            p = p.then(function () { return BOOKS.putBody('btext', b.id, b.chapters); });
+          }
+          return p;
+        });
+      }, Promise.resolve());
+    })
+    .then(function () {
+      if (!BOOKS) return;
+      return (obj.userlib || []).reduce(function (chain, x) {
+        return chain.then(function () { return BOOKS.putBody('userlib', x.id, x); });
+      }, Promise.resolve());
+    })
+    .then(function () {
+      /* ★ 最后才写 meta。到这一步之前，本机看到的还是原来那套。 */
+      if (obj.roll) STORE.putBody('roll', 'main', obj.roll);
+      var meta = obj.meta;
+      if (v.kind === 'light') {
+        /* ★ 轻档没带正文。给这些条目打上「在等正文」，否则下一次 load 就把它们
+           过滤掉了 —— 书架看着恢复了，一操作就空，而且不报错。 */
+        meta = Object.assign({}, meta, {
+          shelf: (meta.shelf || []).map(function (x) {
+            return x.mode === 'library' ? x : Object.assign({}, x, { need_text: true });
+          }),
+        });
+      }
+      STORE.putJSON('meta', meta);
+      bkState('恢复完成，正在重新载入…');
+      setTimeout(function () { location.reload(); }, 400);
+    })
+    .catch(function (e) {
+      RESETTING = false;
+      bkState('恢复失败：' + (e && e.hint ? e.hint : (e && e.message) || '未知原因')
+        + '（原来的数据没有改动）');
+    });
+}
+
+var pendingBackup = null;
+$('backup-input').onchange = function () {
+  var f = this.files && this.files[0];
+  this.value = '';                      // 允许连续选同一个文件
+  if (!f) return;
+  bkState('正在读存档…');
+  unpackBackup(f).then(function (text) {
+    var obj = null;
+    try { obj = JSON.parse(text); }
+    catch (e) { bkState('这不是一个存档文件（解析不了）。'); return; }
+    /* ★ 验包是唯一闸门。它说 ok 之前一个字节都不写。 */
+    var v = MPBackup.validate(obj);
+    if (!v.ok) { bkState(v.why); return; }
+    pendingBackup = { obj: obj, v: v };
+    var extra = '';
+    if (v.kind === 'light') {
+      var need = MPBackup.needReattach(obj.meta.shelf, HASTEXT);
+      if (need.length) extra = ' 这份存档不含正文，恢复后有 ' + need.length
+        + ' 本书要重新导入原文件（进度会接上）。';
+    }
+    bkState('这份存档：' + MPBackup.summary(v.stats) + '。'
+      + '恢复会覆盖这台设备上现有的全部记录。' + extra + ' 再点一次「从备份恢复」确认。');
+    armRestore();
+  }).catch(function (e) {
+    bkState((e && e.message) || '这个文件读不出来。');
+  });
+};
+
+function armRestore() {
+  /* 用「再点一次」而不是 confirm() —— confirm 会阻塞整个页面，
+     而且在有的 WebView 里点不掉就彻底卡死。 */
+  var btns = document.querySelectorAll('#s-me .btn.ghost');
+  for (var i = 0; i < btns.length; i++) {
+    var b = btns[i];
+    if (b.lastChild && /从备份恢复|确认恢复/.test(b.lastChild.textContent)) {
+      b.lastChild.textContent = '确认恢复（会覆盖现有记录）';
+      b.onclick = function () {
+        if (!pendingBackup) return;
+        applyBackup(pendingBackup.obj, pendingBackup.v);
+      };
+      return;
+    }
+  }
+}
+
+/** 清档用：把整个 IndexedDB 删掉。删不掉也不能卡住清档流程。 */
+function dropBooksDb() {
+  return new Promise(function (resolve) {
+    try {
+      if (BOOKS && BOOKS.close) BOOKS.close();
+      var req = indexedDB.deleteDatabase(MPIdb.DB_NAME);
+      req.onsuccess = req.onerror = req.onblocked = function () { resolve(); };
+      setTimeout(resolve, 2000);        // 有别的标签页开着会 blocked，别无限等
+    } catch (e) { resolve(); }
+  });
+}
+
 function openBooks() {
   return MPIdb.open({ prefix: 'mp5' }).then(function (st) {
     BOOKS = st; idbWarn = null; return st;
@@ -8572,8 +8975,10 @@ function load() {
         Object.keys(HASTEXT).forEach(function (id) { if (mine.indexOf(id) < 0) delete HASTEXT[id]; });
       });
     }).then(function () {
-      /* ★ 反向也要清：正文丢了的条目不许留在书架上。 */
-      S.shelf = S.shelf.filter(function (x) { return x.mode === 'library' || hasBook(x.id); });
+      /* ★ 反向也要清：正文丢了的条目不许留在书架上 ——
+         但「从轻档恢复、还在等重新导入」的条目（need_text）要留着，
+         判断见 MPShelf.keepable。 */
+      S.shelf = S.shelf.filter(function (x) { return MPShelf.keepable(x, HASTEXT); });
       if (!d.current) return false;
       return Promise.resolve(openShelfBook(MPShelf.find(S.shelf, d.current), { silent: true }))
         .then(function () { return !!S.book; });
@@ -8975,6 +9380,14 @@ function openShelfBook(entry, o) {
   }
   return got.then(function (book) {
     if (!book) {
+      if (entry.need_text) {
+        /* 从轻档恢复来的，本来就没正文。★ 绝不能删 —— 删了就再也接不上进度了。 */
+        if (!opt.silent) {
+          toast('《' + entry.title + '》还没有正文。用「上传自己的书」导入原文件，'
+            + '会自动接上第 ' + (entry.ch || 1) + ' 章的进度。');
+        }
+        return false;
+      }
       /* ★ 不许留一条点开是空白的条目 —— 说清楚并把它从书架上拿掉。 */
       S.shelf = MPShelf.remove(S.shelf, entry.id);
       save();
@@ -9283,6 +9696,13 @@ function acceptBook(bk, extra) {
   var book = { meta: bk.meta, chapters: bk.chapters, index: bk.index,
     perChapter: bk.perChapter, scannedTo: bk.scannedTo };
   book.meta.vocab = S.profile.vocab_preset;
+
+  /* ★ 认领书架上同名的条目（换设备后只带了学习记录、或者重复导入同一本）。
+     复用它的 id，upsert 就会把 ch/gch 接上 —— 否则书架上会多一条从头开始的书，
+     旧条目那「读到第 1024 章」永远对不上，而且不报错。 */
+  var claimed = MPShelf.claimByTitle(S.shelf, book.meta.title);
+  if (claimed) book.meta.id = claimed.id;
+
   S.book = book; S.history = [];
 
   var entry = MPShelf.entryOf(book, { cover: e.cover || coverOf(book), author: e.author });
@@ -9321,7 +9741,7 @@ function acceptBook(bk, extra) {
     goto('s-shelf');
     toast('《' + book.meta.title + '》已放进书架 · ' + book.meta.chapters + ' 章 · 能教你 '
       + num(cov.words) + ' 个' + S.profile.vocab_preset + '词'
-      + (saved.ch > 1 ? '\n上次读到第 ' + saved.ch + ' 章，点开就接着读。' : ''));
+      + (saved.ch > 1 ? '\n' + (claimed ? '接上了之前的进度：' : '') + '上次读到第 ' + saved.ch + ' 章，点开就接着读。' : ''));
   });
 }
 
@@ -10374,6 +10794,36 @@ function paintMe() {
   }
   b.appendChild(setc);
 
+  /* ---- 存档：导出 / 导入 ----
+     ★ 阅读记录只在这台设备的 IndexedDB 里。删掉主屏图标、换手机、
+       清一次网站数据，几个月的进度就没了，而且没有任何地方能找回来。 */
+  var bak = el('div', 'card'); bak.style.marginTop = '16px';
+  bak.appendChild(el('div', 'kicker', '备份与迁移'));
+  var bkNote = el('p', 'lbl');
+  bkNote.style.margin = '0 0 12px';
+  bkNote.textContent = '记录只存在这台设备上。换手机之前先导出一份。';
+  bak.appendChild(bkNote);
+
+  var expFull = el('button', 'btn ghost');
+  expFull.appendChild(svg('download')); expFull.appendChild(el('span', null, '导出完整备份（含正文）'));
+  expFull.onclick = function () { doExport('full', expFull); };
+  bak.appendChild(expFull);
+
+  var expLight = el('button', 'btn ghost'); expLight.style.marginTop = '8px';
+  expLight.appendChild(svg('download')); expLight.appendChild(el('span', null, '只导学习记录（小，不含正文）'));
+  expLight.onclick = function () { doExport('light', expLight); };
+  bak.appendChild(expLight);
+
+  var imp = el('button', 'btn ghost'); imp.style.marginTop = '8px';
+  imp.appendChild(svg('upload')); imp.appendChild(el('span', null, '从备份恢复'));
+  imp.onclick = function () { $('backup-input').click(); };
+  bak.appendChild(imp);
+
+  var bkState = el('p', 'lbl'); bkState.id = 'backup-state';
+  bkState.style.cssText = 'margin:10px 0 0;min-height:1em';
+  bak.appendChild(bkState);
+  b.appendChild(bak);
+
   var reset = el('button', 'btn ghost');
   reset.appendChild(svg('trash')); reset.appendChild(el('span', null, '清除本地数据并重来'));
   reset.onclick = function () {
@@ -10387,7 +10837,10 @@ function paintMe() {
           if (k.indexOf('mp5:') === 0 || k === OLD_KEY) localStorage.removeItem(k);
         });
       } catch (e) { /* 隐身窗口：本来也没存上 */ }
-      location.reload(); return;
+      /* ★ 书现在在 IndexedDB 里，光清 localStorage 等于没清 —— 刷新之后
+         书架是空的但 20 MB 正文还占着，而且再也没人认领。整个库删掉最干净。 */
+      dropBooksDb().then(function () { location.reload(); });
+      return;
     }
     reset.dataset.armed = '1'; reset.lastChild.textContent = '再点一次就真的清了';
   };
