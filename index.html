@@ -307,7 +307,14 @@ w.open>.on{color:var(--ink)}
 .wpop .acts button{border:0;background:none;padding:0;font:400 12px/1.6 var(--font);color:var(--foot);cursor:pointer}
 
 /* 章末结算（v14 08 屏）：只报「你自己做过的事」 */
-.settle{margin:44px -26px 0;padding:34px 26px 30px;border-top:1px dashed var(--dash);text-indent:0}
+/* 章节分隔。★ 这里曾经是一整屏结算（时长/积分/勋章 + 一个必须点的「继续读」按钮）。
+   小说读到一章末尾该做的事只有一件：让人知道章断了，然后继续。 */
+.chend-line{height:1px;background:var(--line,rgba(0,0,0,.08));margin:26px 0 18px}
+.chend-t{font:500 14px/1.5 var(--font);color:var(--muted);text-align:center;
+  padding-bottom:40px}
+
+/* 章末容器。原来带虚线上边框和一大块留白，是为了托住那整屏结算；现在只托一条分隔。 */
+.settle{margin:0;padding:0;text-indent:0}
 .settle .eyebrow{color:var(--on-cream)}
 .settle h3{margin:14px 0 0;font:600 26px/1.35 var(--font);color:var(--ink)}
 .settle .line{margin-top:12px;font:400 14px/1.75 var(--font);color:var(--sub)}
@@ -10092,12 +10099,23 @@ function scanInitial(bk, onProgress) {
   });
 }
 
-function ensureScanned() {
-  var total = S.book.chapters.length;
-  var range = MPImport.nextScanRange(S.book.scannedTo || 0, total, S.ch);
-  if (!range) return false;
-  var t0 = Date.now();
-  var scan = MPImport.prescan(S.book.chapters, BRIDGE, { from: range.from, to: range.to });
+/* -------------------------------------------------------------
+   预扫描：把「找词」这件事挪到读者背后去做
+   -------------------------------------------------------------
+   ★ 原来是同步的：读到快追上已扫边界时，当场扫 20 章（实测 ~440ms）
+     再继续渲染，还弹一句「又处理了第 21–40 章（437ms）」。
+     翻页翻到那一章就会顿一下，而且那句 toast 是在跟读者邀功 ——
+     读者不需要知道这个程序在忙什么。
+   ★ 现在：当前章缺的那几章同步补上（一章 ~20ms，不会顿），
+     后面的在空闲时一批一批地扫，不挡渲染、不出声。
+   ★ 提前量拉大到 40 章：连续滑动时 5 章的缓冲根本跟不上。
+   ------------------------------------------------------------- */
+var SCAN_AHEAD_FAR = 40;             // 后台要扫到当前章之后多少章
+var scanBusy = false;
+
+/** 把某一段扫了并并进书里。纯粹的状态更新，不碰界面。 */
+function scanRange(from, to) {
+  var scan = MPImport.prescan(S.book.chapters, BRIDGE, { from: from, to: to });
   var merged = MPImport.mergeScan(
     { index: S.book.index, perChapter: S.book.perChapter, scannedTo: S.book.scannedTo, meta: S.book.meta }, scan);
   S.book.index = merged.index;
@@ -10106,10 +10124,46 @@ function ensureScanned() {
   S.book.meta.guards = merged.guards;
   S.book.meta.coverage = { words: merged.words, slots: merged.slots };
   S.book.meta.scannedTo = merged.scannedTo;
-  saveIndexOnly(S.book); save();
-  toast('又处理了第 ' + range.from + '–' + range.to + ' 章（' + (Date.now() - t0) + 'ms）。'
-    + (merged.scannedTo >= total ? '全书处理完了。' : '还剩 ' + (total - merged.scannedTo) + ' 章。'));
+}
+
+/**
+ * 当前章必须已经扫过 —— 这一条是同步的，因为渲染要用。
+ * 只补到当前章为止，通常是 0–2 章，几十毫秒。
+ */
+function ensureScanned() {
+  if (!S.book) return false;
+  var to = Math.min(S.book.chapters.length, S.ch);
+  var from = (S.book.scannedTo || 0) + 1;
+  if (from > to) return false;
+  scanRange(from, to);
+  saveIndexOnly(S.book);
   return true;
+}
+
+/**
+ * 后台把后面的章扫上，一批一批，中间让出主线程。
+ * ★ 不 toast、不挡渲染、扫完不声张。
+ */
+function scanAhead() {
+  if (scanBusy || !S.book) return;
+  var total = S.book.chapters.length;
+  var target = Math.min(total, S.ch + SCAN_AHEAD_FAR);
+  if ((S.book.scannedTo || 0) >= target) return;
+  scanBusy = true;
+  var bookId = S.book.meta.id;
+  function step() {
+    /* ★ 中途换了书就停 —— 否则会把 A 书的扫描结果并进 B 书，而且不报错。 */
+    if (!S.book || S.book.meta.id !== bookId) { scanBusy = false; return; }
+    var from = (S.book.scannedTo || 0) + 1;
+    if (from > target) {
+      scanBusy = false;
+      saveIndexOnly(S.book);
+      return;
+    }
+    scanRange(from, Math.min(target, from + 9));      // 一批 10 章 ≈ 220ms
+    MPFormats.deps.nextTick(step);
+  }
+  MPFormats.deps.nextTick(step);
 }
 
 /**
@@ -10120,7 +10174,8 @@ function renderChapter(o) {
   var opt = o || {};
   var keepTop = opt.keepScroll ? $('read-scroll').scrollTop : 0;
   flushClock();                               // 上一段阅读时长记到上一章头上
-  ensureScanned();
+  ensureScanned();                            // 当前章必须已扫（同步，通常 0–2 章）
+  scanAhead();                                // 后面的在背后慢慢扫，不挡这一次渲染
   var chapter = curChapter();
   var key = visitKey();
   settleLadder(key);                          // 上一章的访问结算 → 隐式作答 → 词状态（先于调度）
@@ -10276,7 +10331,12 @@ document.addEventListener('visibilitychange', function () {
   else CLOCK.last = Date.now();
 });
 window.addEventListener('pagehide', function () { flushClock(); save(); });
-$('read-scroll').addEventListener('scroll', touch, { passive: true });
+$('read-scroll').addEventListener('scroll', function () {
+  touch();
+  /* 只在阅读页里管用 */
+  if (!$('s-read').classList.contains('on')) return;
+  if (atBottom()) advanceChapter();
+}, { passive: true });
 
 /* -------------------------------------------------------------
    阅读会话（G7：一次阅读会话最多一次虚荣提示）
@@ -10326,73 +10386,26 @@ function showExitBar() {
    ★ 勋章卡受 G7 管：一次阅读会话最多一次，冷启动的第一屏不出。
    ------------------------------------------------------------- */
 function paintSettle() {
+  /* ★ 这里原来是一整屏结算：读了多少分钟、多少词没点开、积分、勋章，
+     还有一个「继续读第 N 章」的按钮 —— 读者必须点它才能往下读。
+     那是在一本小说的每一章末尾插一段广告，然后要求读者鼓掌。
+     现在只留一条分隔和下一章的标题：看得出章断了，滑过去就继续。
+     统计没有消失，它们在「进展」页；该记的事件照旧在滚过这里时记。 */
   var box = $('chapter-end'); box.innerHTML = '';
-  var R = S.lastRender;
-  if (!R || !S.book) return;
-  var dg = progDigest();
-  var sm = MPProg.chapterSummary(dg, R.key);
-  var ms = sm.ms + CLOCK.pending;
+  if (!S.book) return;
   var last = S.ch >= S.book.chapters.length;
-  var ids = {}; R.replaced.forEach(function (x) { ids[x.word_id] = x.tier; });
-  var nWords = Object.keys(ids).length;
-  var nEn = Object.keys(ids).filter(function (k) { return ids[k] === 1; }).length;
 
-  box.appendChild(el('div', 'eyebrow', '第 ' + S.ch + ' 章读完'));
-  var title, line;
-  if (S.englishOff) {
-    title = '这一章你读的是原文';
-    line = '没有替换，也就没有什么要点开的。想恢复替换，点顶栏的「开英文」。';
-  } else if (!nWords) {
-    title = '这一章没有替换';
-    line = '这一章里没有你词表里的词，就当读小说。';
-  } else if (sm.pct != null) {
-    title = '这一章你有 ' + sm.pct + '% 的词没点开';
-    line = sm.en + ' 个只显示英文的词里，你点开了 ' + sm.tapped + ' 个。';
-  } else if (!nEn) {
-    title = '这一章的 ' + nWords + ' 个词都还带着中文';
-    line = '新词会先中英一起出现几次，读顺了就只留英文。';
-  } else {
-    /* ★ 不写「大多还带着中文」：纯英文的词可能正是多数，只是不到 3 个（G2），不给比例而已 */
-    title = '这一章只显示英文的词有 ' + nEn + ' 个';
-    line = '不到 ' + MPProg.EVIDENCE_MIN_EN + ' 个不算比例 —— 这 ' + nEn + ' 个里你点开了 ' + sm.tapped + ' 个。';
+  if (last) {
+    box.appendChild(el('div', 'chend-line'));
+    box.appendChild(el('div', 'chend-t', '《' + S.book.meta.title + '》读完了'));
+    var go = el('button', 'btn go'); go.style.marginTop = '14px';
+    go.appendChild(el('span', null, '看看读了些什么'));
+    go.onclick = function () { markVanity(); leaveReading('s-prog'); };
+    box.appendChild(go);
+    return;
   }
-  if (sm.holds) {
-    var lw = S.sess && S.sess.lowered[R.key];
-    line += '长按了 ' + sm.holds + ' 次，' + (lw
-      ? '下一章起密度降到「' + (MPProg.DENSITY_NAME[S.profile.density] || S.profile.density) + '」。'
-      : '密度保持不变。');
-  }
-  if (S.gch === 1 && !S.englishOff) {
-    var d1 = MPDiff.densityFor(S.profile, 1), d2 = MPDiff.densityFor(S.profile, 2);
-    if (d2 > d1) line += '第一章压到了每千字 ' + d1 + ' 词，下一章起回到你选的每千字 ' + d2 + ' 词。';
-  }
-  box.appendChild(el('h3', null, title));
-  box.appendChild(el('div', 'line', line));
-
-  var allowed = S.sess && !S.englishOff
-    && (S.sess.vanityKey === R.key || MPProg.vanityGate(S.sess, 'chapter_end'));
-  if (allowed) {
-    var mc = medalCard(dg, sm);
-    if (mc) { mc.classList.add('vain'); box.appendChild(mc); }
-  }
-
-  var wk = MPProg.week(dg, retToday());
-  var st = el('div', 'stat3');
-  [[String(Math.round(ms / 60000)), '分钟', ''], ['+' + MPProg.chapterPoints(ms), '积分', ''],
-   [String(wk.readDays), '本周天数', 'g']].forEach(function (x) {
-    var d = el('div');
-    d.appendChild(el('div', 'n' + (x[2] ? ' ' + x[2] : ''), x[0]));
-    d.appendChild(el('div', 'l', x[1]));
-    st.appendChild(d);
-  });
-  box.appendChild(st);
-
-  var go = el('button', 'btn go', last ? '读完了 · 看下一本' : '继续读第 ' + (S.ch + 1) + ' 章');
-  go.onclick = function () { markVanity(); finishChapter(); save(); nextChapter(); };
-  box.appendChild(go);
-  var lk = el('button', 'textlink', '看进展');
-  lk.onclick = function () { markVanity(); leaveReading('s-prog'); };
-  box.appendChild(lk);
+  box.appendChild(el('div', 'chend-line'));
+  box.appendChild(el('div', 'chend-t', chapterLabel(S.ch + 1, S.book.chapters[S.ch].title)));
 }
 /** 结算页的那张勋章卡：刚拿到的优先；没有就给离得最近的那一枚的进度。都不合适就不给。 */
 function medalCard(dg, sm) {
@@ -10431,18 +10444,53 @@ function markVanity() {
 }
 /* 结算页滚进来的时候刷新一次（时长在涨），并认定「这一程的那一次」已经用掉了 */
 var _ioEnd = null;
+/**
+ * 滚到章末就自动进入下一章。
+ * ★ 不再等读者点按钮。该结算的（阅读时长、chapter_done、里程表、梯子）
+ *   在这里静默做掉 —— 读者感觉不到，数据一条不少。
+ * ★ 用 `advancing` 挡重入：IntersectionObserver 在一次滚动里会连报几次，
+ *   不挡的话会一口气翻掉好几章，而且不报错。
+ */
+/**
+ * 滑到底就自动进入下一章。
+ *
+ * ★ 不再等读者点按钮。该结算的（阅读时长、chapter_done、里程表、梯子）
+ *   在这里静默做掉 —— 读者感觉不到，数据一条不少。
+ * ★ 判据是「滚动容器到底了」，不是用 IntersectionObserver 观察章末那块：
+ *   IO 在后台标签页里根本不计算交叉（浏览器不做布局），
+ *   而且「某个元素露出了多少」离读者的实际感受隔了一层 ——
+ *   「我滑到底了」才是那件事本身。
+ * ★ advancing 挡重入：一次滑动会连发几十个 scroll 事件，
+ *   不挡的话一口气翻掉好几章，而且不报错。
+ */
+var advancing = false;
+function atBottom() {
+  var sc = $('read-scroll');
+  /* ★ 短到不用滚的章不算「滑到底」。否则 scrollTop(0)+clientHeight 天然
+     就 >= scrollHeight，随便一个橡皮筋回弹的 scroll 事件就把人翻走了 ——
+     那一章一个字都没看着。这种章走章末那行字手动点。 */
+  if (sc.scrollHeight <= sc.clientHeight + 8) return false;
+  return sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 8;
+}
+function advanceChapter() {
+  if (advancing || !S.book) return false;
+  if (S.ch >= S.book.chapters.length) return false;      // 最后一章不自动翻
+  advancing = true;
+  markVanity();
+  finishChapter();
+  save();
+  nextChapter();            // 里面会 renderChapter → watchSettle → advancing 归零
+  return true;
+}
 function watchSettle() {
-  if (_ioEnd) _ioEnd.disconnect();
-  _ioEnd = new IntersectionObserver(function (es) {
-    es.forEach(function (en) {
-      if (!en.isIntersecting) return;
-      paintSettle();
-      if ($('chapter-end').querySelector('.mcard.vain') && S.sess && S.lastRender) {
-        S.sess.vanityShown = true; S.sess.vanityKey = S.lastRender.key;
-      }
-    });
-  }, { root: $('read-scroll'), threshold: 0.15 });
-  _ioEnd.observe($('chapter-end'));
+  if (_ioEnd) { _ioEnd.disconnect(); _ioEnd = null; }
+  advancing = false;
+  /* 章末那行字可以点 —— 给「这一章短得不用滚」和「想快点翻」的人一个入口。 */
+  var t = $('chapter-end').querySelector('.chend-t');
+  if (t && S.book && S.ch < S.book.chapters.length) {
+    t.style.cursor = 'pointer';
+    t.onclick = function () { advanceChapter(); };
+  }
 }
 
 function finishChapter() {
