@@ -6591,7 +6591,26 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
     return s;
   }
 
+  /**
+   * 让出主线程，让浏览器有机会把界面画出来，然后继续。
+   *
+   * ★ 不要用 setTimeout(fn, 0)。**后台标签页里它会被钳到 1 秒一次** ——
+   *   实测：19 MB 的 epub 分批解析，前台 5 秒的活儿在后台标签页里要跑 90 秒，
+   *   进度条一秒动一格，看着像卡死。用户导入时切出去看一眼微信就会中招。
+   *   MessageChannel 的回调也是宏任务（同样能让出渲染），但不吃那个节流。
+   */
+  function nextTick(fn) {
+    if (typeof MessageChannel !== 'undefined') {
+      const ch = new MessageChannel();
+      ch.port1.onmessage = function () { ch.port1.close(); fn(); };
+      ch.port2.postMessage(0);
+      return;
+    }
+    setTimeout(fn, 0);
+  }
+
   return {
+    nextTick: nextTick,
     engine: I,
     toBytes: I.toBytes,
     bytesToText: bytesToText,
@@ -7548,7 +7567,8 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
   }
 
   /* ---------- 主流程 ---------- */
-  function parse(buf, opts) {
+  /** 前半段：zip / OPF / 目录 / spine。不读正文。 */
+  function prepare(buf, opts) {
     const o = opts || {};
     const warnings = [];
     const zip = Zip.open(buf);
@@ -7646,41 +7666,92 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
     const tocByPath = Object.create(null);
     toc.forEach(function (t) { (tocByPath[t.path] || (tocByPath[t.path] = [])).push(t); });
 
-    // 8. 逐 spine 项取正文 → 按目录锚点切段
-    const sections = [];
-    let missing = 0;
-    spine.forEach(function (item, si) {
-      const name = Zip.resolveName(zip, item.path);
-      if (!name) { missing++; warnings.push('正文文件不存在: ' + item.path); return; }
-      const html = Zip.readText(zip, name);
-      const parsed = H2T.toBlocks(html);
-      const entries = tocByPath[item.path] || [];
-      const pieces = splitByAnchors(parsed.blocks, entries);
-      pieces.forEach(function (pc, pi) {
-        sections.push({
-          href: item.path + (pc.frag ? '#' + pc.frag : ''),
-          spineIndex: si,
-          title: pc.title,                 // 来自目录；null 表示目录没给
-          docTitle: parsed.docTitle,       // <title>，仅作兜底线索
-          blocks: pc.blocks,
-          chars: pc.blocks.reduce(function (a, b) { return a + b.text.length; }, 0),
-        });
+    /* 8. 前半到此为止。
+       ★ 「逐 spine 项取正文」是整个导入里最慢的一段：实测 19 MB / 1356 章的书
+         要 5.3 秒，比后面扫 20 章（0.44 秒）长一个量级。它原本写死成一个
+         同步 forEach，占着主线程 —— 就算回调了进度，DOM 也不会重绘。
+         所以拆成 prepare / readSection / finish 三段，让调用方自己决定怎么驱动：
+         同步一把梭（parse），还是分批让出主线程（parseAsync）。
+       ★ 循环体只有 readSection 这一份，两条路共用，不会漂。 */
+    return {
+      zip: zip, meta: meta, spine: spine, toc: toc, tocByPath: tocByPath,
+      warnings: warnings, sections: [], missing: 0,
+    };
+  }
+
+  /** 读一个 spine 项 → 若干 section。就地改 ctx。 */
+  function readSection(ctx, si) {
+    const item = ctx.spine[si];
+    const name = Zip.resolveName(ctx.zip, item.path);
+    if (!name) { ctx.missing++; ctx.warnings.push('正文文件不存在: ' + item.path); return; }
+    const html = Zip.readText(ctx.zip, name);
+    const parsed = H2T.toBlocks(html);
+    const entries = ctx.tocByPath[item.path] || [];
+    const pieces = splitByAnchors(parsed.blocks, entries);
+    pieces.forEach(function (pc) {
+      ctx.sections.push({
+        href: item.path + (pc.frag ? '#' + pc.frag : ''),
+        spineIndex: si,
+        title: pc.title,                 // 来自目录；null 表示目录没给
+        docTitle: parsed.docTitle,       // <title>，仅作兜底线索
+        blocks: pc.blocks,
+        chars: pc.blocks.reduce(function (a, b) { return a + b.text.length; }, 0),
       });
     });
-    if (!sections.length) throw err('CORRUPT', 'spine 里没有一个正文文件能读出来');
-    if (missing) warnings.push('共 ' + missing + ' 个正文文件缺失');
+  }
 
+  /** 组装返回值。 */
+  function finish(ctx) {
+    if (!ctx.sections.length) throw err('CORRUPT', 'spine 里没有一个正文文件能读出来');
+    if (ctx.missing) ctx.warnings.push('共 ' + ctx.missing + ' 个正文文件缺失');
     return {
       format: 'epub',
-      title: meta.title || null,
-      author: meta.creator || null,
-      language: meta.language || null,
-      identifier: meta.identifier || null,
-      sections: sections,
-      toc: toc,
-      spineCount: spine.length,
-      warnings: warnings,
+      title: ctx.meta.title || null,
+      author: ctx.meta.creator || null,
+      language: ctx.meta.language || null,
+      identifier: ctx.meta.identifier || null,
+      sections: ctx.sections,
+      toc: ctx.toc,
+      spineCount: ctx.spine.length,
+      warnings: ctx.warnings,
     };
+  }
+
+  /** 同步解析。行为和拆分前逐字一致 —— smoke 第 21 节盯着这一条。 */
+  function parse(buf, opts) {
+    const ctx = prepare(buf, opts);
+    for (let i = 0; i < ctx.spine.length; i++) readSection(ctx, i);
+    return finish(ctx);
+  }
+
+  /**
+   * 异步解析：分批读，每批之间让出主线程，好让进度画得出来、界面不冻。
+   * @param {Object} opts 额外支持 {onProgress(done,total), step}
+   * @returns {Promise}
+   */
+  function parseAsync(buf, opts) {
+    const o = opts || {};
+    /* ★ 每批至少读一项。step 传了 0 或负数的话，「读了 0 项然后继续排下一批」
+       就是个静默死循环 —— 页面不报错、不白屏，只是永远停在「正在解压」。 */
+    const step = Math.max(1, o.step || 20);   // 一批 20 项 ≈ 80ms，够细也不至于被 setTimeout 拖垮
+    return new Promise(function (resolve, reject) {
+      let ctx;
+      try { ctx = prepare(buf, o); } catch (e) { reject(e); return; }
+      let i = 0;
+      const total = ctx.spine.length;
+      if (o.onProgress) { try { o.onProgress(0, total); } catch (e) { /* 画进度炸了不该连累解析 */ } }
+      function batch() {
+        try {
+          const end = Math.min(total, i + step);
+          if (end <= i) { reject(new Error('epub 分批解析没有推进（step=' + step + '）')); return; }
+          for (; i < end; i++) readSection(ctx, i);
+          if (o.onProgress) { try { o.onProgress(i, total); } catch (e) { /* 同上 */ } }
+          if (i >= total) { resolve(finish(ctx)); return; }
+          Deps.nextTick(batch);       // ★ 不是 setTimeout —— 后台标签页里它被钳到 1 秒一次
+        } catch (e) { reject(e); }
+      }
+      batch();
+    });
   }
 
   /** 目录若有多条指向同一文件的不同锚点，就在对应 id 的块处切开 */
@@ -7750,7 +7821,7 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
     return out;
   }
 
-  return { parse: parse, parseNav: parseNav, parseNcx: parseNcx, splitByAnchors: splitByAnchors, resolvePath: resolvePath, _xml: { openTags: openTags, elements: elements, textOf: textOf } };
+  return { parse: parse, parseAsync: parseAsync, prepare: prepare, readSection: readSection, finish: finish, parseNav: parseNav, parseNcx: parseNcx, splitByAnchors: splitByAnchors, resolvePath: resolvePath, _xml: { openTags: openTags, elements: elements, textOf: textOf } };
 });
 
 </script>
@@ -8256,6 +8327,37 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
     throw err('UNSUPPORTED', '未知路由 ' + s.format, SUPPORTED_HINT);
   }
 
+  /**
+   * 异步解析。目前只有 epub 真的分批（它是最慢的：19 MB / 1356 章 实测 5.3 秒），
+   * txt / mobi 照旧同步，只是包了一层 Promise，好让调用方一视同仁。
+   * @param {Object} opts 额外支持 {onProgress(done,total,phase)}
+   */
+  function parseBookAsync(buf, opts) {
+    const o = opts || {};
+    let bytes, s;
+    try {
+      bytes = Deps.toBytes(buf);
+      s = Sniff.sniff(bytes);
+      if (s.format === 'unsupported') {
+        throw err('UNSUPPORTED', '不支持的文件类型: ' + s.kind,
+          (s.hint || '认不出这个文件的格式。') + (s.kind === 'binary' ? '' : ' ' + SUPPORTED_HINT));
+      }
+    } catch (e) { return Promise.reject(e); }
+
+    if (s.format !== 'epub') {
+      /* ★ 同步那条路原样跑，包成 Promise。不许在这里另写一份分支逻辑 —— 
+         两份实现迟早会漂，而「解析结果差一点」在界面上看都像正常的书。 */
+      try { return Promise.resolve(parseBook(buf, o)); } catch (e) { return Promise.reject(e); }
+    }
+    return parseEpubAsync(bytes, s, o);
+  }
+
+  function parseEpubAsync(bytes, s, o) {
+    return Epub.parseAsync(bytes, o)
+      .catch(function (e) { throw normalizeError(e, 'epub'); })
+      .then(function (p) { return buildEpub(p, s, o); });
+  }
+
   /* ---------- TXT：完全走主引擎，这里一行逻辑都不加 ---------- */
   function parseTxt(bytes, s, o) {
     const detect = Deps.detectEncoding(bytes);
@@ -8275,6 +8377,11 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
   function parseEpub(bytes, s, o) {
     let p;
     try { p = Epub.parse(bytes, o); } catch (e) { throw normalizeError(e, 'epub'); }
+    return buildEpub(p, s, o);
+  }
+
+  /** Epub.parse 之后的组装。★ 同步和异步两条路共用，不许各写一份。 */
+  function buildEpub(p, s, o) {
     const built = Chapters.build(p.sections, Object.assign({ hasToc: p.toc.length > 0 }, o.chapters || {}));
     if (!built.chapters.length) throw err('CORRUPT', 'epub 没解出任何章节', '这本书的正文是空的，可能只有图片。');
     return {
@@ -8332,8 +8439,28 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
     return r;
   }
 
+  /** importAny 的异步版：解析走分批，后面的 importBook/importChapters 照旧。 */
+  function importAnyAsync(buf, opts) {
+    const o = opts || {};
+    return parseBookAsync(buf, o).then(function (parsed) {
+      if (parsed.format === 'txt') {
+        const r = Deps.engine.importBook(parsed.text, o);
+        r.meta.encoding = parsed.encoding;
+        r.parsed = parsed;
+        return r;
+      }
+      const r = Deps.engine.importChapters(parsed.chapters, Object.assign({}, o, {
+        title: o.title || parsed.title || '未命名',
+        encoding: parsed.format,
+      }));
+      r.parsed = parsed;
+      return r;
+    });
+  }
+
   return {
     parseBook: parseBook, importAny: importAny,
+    parseBookAsync: parseBookAsync, importAnyAsync: importAnyAsync,
     sniff: Sniff.sniff,
     deps: Deps, epub: Epub, mobi: Mobi, html2text: H2T, chapters: Chapters,
   };
@@ -9821,8 +9948,9 @@ function gotoRead() { $('phone').classList.remove('wizard'); goto('s-read'); ren
  * ★ 为什么不能一口气扫完：实测浏览器里扫 20 章要 5.4 秒（Node 里只要 0.11 秒，
  *   差 50 倍），手机上更久。同步扫的话这几十秒里界面完全冻住 —— 用户看到的就是
  *   一个不动的转圈，以为「一直在解析」。
- * ★ 每批之间必须 setTimeout 让出主线程，否则进度条根本画不出来
+ * ★ 每批之间必须让出主线程，否则进度条根本画不出来
  *   （改成同步循环的话，浏览器会把所有 checkList 重绘攒到最后一次性画）。
+ *   ★ 用 deps.nextTick 不用 setTimeout —— 后者在后台标签页里被钳到 1 秒一次。
  * @param {Object} bk importAny(scanTo:0) 的产物，就地改它的 index/perChapter/scannedTo
  * @param {Function} onProgress (done, total)
  * @returns {Promise}
@@ -9858,7 +9986,8 @@ function scanInitial(bk, onProgress) {
       bk.meta.coverage = { words: merged.words, slots: merged.slots };
       bk.meta.scannedTo = merged.scannedTo;
       if (onProgress) { try { onProgress(bk.scannedTo, target); } catch (e) { /* 画进度炸了不该连累导入 */ } }
-      setTimeout(batch, 0);
+      /* ★ 同 epub 解析：setTimeout 在后台标签页里会被钳到 1 秒一次 */
+      MPFormats.deps.nextTick(batch);
     }
     batch();
   });
@@ -10966,19 +11095,28 @@ function importEbook(buf, fileBase) {
      spine.forEach 占着主线程，就算回调了 DOM 也不会重绘。
      所以至少把「在干什么、大概多久」说清楚，别让人对着一个不动的转圈猜。 */
   var mb = (buf.byteLength / 1048576).toFixed(1);
-  checkList([['读取文件', 'ok'],
-    ['正在解压 ' + mb + ' MB 的电子书' + (buf.byteLength > 5 * 1048576 ? '，大书要几秒' : ''), 'run']]);
-  setTimeout(function () {
-    var t0 = Date.now(), bk;
-    try {
-      /* scanTo:0 —— 只解析切章，扫描交给下面的 scanInitial 分批做，好让进度看得见 */
-      bk = MPFormats.importAny(buf, { bridge: BRIDGE, today: today(), scanTo: 0 });
-    } catch (e) {
-      // hint 是给读者看的一句话（DRM / 不支持的格式 / 文件坏了），不是异常 message
-      checkList([['读取文件', 'ok'], [e.hint || '这个文件读不出来。', 'bad']]);
-      show($('enc-fallback'), false);
-      return;
-    }
+  var t0 = Date.now(), lastPaint = 0;
+  checkList([['读取文件', 'ok'], ['正在解压 ' + mb + ' MB 的电子书', 'run']]);
+
+  /* ★ 解压 + 转文本是整个导入里最慢的一段（19 MB / 1356 章 实测 5.3 秒）。
+     走 importAnyAsync：epub 分批读 spine，每批之间让出主线程 ——
+     进度画得出来，界面也不冻。 */
+  MPFormats.importAnyAsync(buf, {
+    bridge: BRIDGE, today: today(), scanTo: 0,
+    onProgress: function (done, total) {
+      var now = Date.now();
+      if (done < total && now - lastPaint < 150) return;
+      lastPaint = now;
+      checkList([['读取文件', 'ok'],
+        ['正在解压 ' + mb + ' MB 的电子书 · ' + done + '/' + total + ' 篇', done >= total ? 'ok' : 'run']]);
+    },
+  }).catch(function (e) {
+    // hint 是给读者看的一句话（DRM / 不支持的格式 / 文件坏了），不是异常 message
+    checkList([['读取文件', 'ok'], [e.hint || '这个文件读不出来。', 'bad']]);
+    show($('enc-fallback'), false);
+    return null;
+  }).then(function (bk) {
+    if (!bk) return;
     if (bk.meta.title === '未命名' && fileBase) bk.meta.title = fileBase;
     var p = bk.parsed;
     var items = [
@@ -10990,7 +11128,7 @@ function importEbook(buf, fileBase) {
     ];
     (p.warnings || []).slice(0, 3).forEach(function (w) { items.push([w, 'warn']); });
     runInitialScan(bk, items, t0, { author: p.author });
-  }, 200);
+  });
 }
 $('file-input').onchange = function () { readFile(this.files && this.files[0]); };
 Array.prototype.forEach.call($('enc-fallback').querySelectorAll('[data-enc]'), function (b) {
