@@ -839,6 +839,8 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
       <div style="flex:1;text-align:center"><span class="sub" id="toc-crumb">目录</span></div>
       <button class="toptog" id="toc-filter">只替见过的</button>
     </div>
+    <div class="searchbar" style="margin:10px 16px 0"><svg class="ic sm"><use href="#i-search"/></svg>
+      <input id="toc-q" placeholder="搜章名或章号，如 毁尸散 / 1024"></div>
     <div class="scroll" id="toc-body"></div>
   </section>
 
@@ -6217,6 +6219,127 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
 
 </script>
 <script>
+/* ../miniprogram/engine/toc.js */
+/* =============================================================
+   toc.js · 目录搜索（纯函数，Node 可测）。零依赖，UMD：挂 globalThis.MPToc。
+
+   为什么要它：一本网文 1800+ 章，换了设备之后「我上次读到哪」只能靠翻。
+   用户记得的通常是两样东西之一 —— 章号（「一千零几章」）或者章名里的
+   某个词（「毁尸散那章」）。这两条都得能搜。
+
+   ★ 搜的是「第N章 + 章名」拼起来的一整串，不是只搜章名。
+     章名里往往不含章号（分章时已经剥掉了），只搜章名的话输入「25」搜不到第 25 章。
+
+   匹配分五档，档位本身就是排序依据（档内按章号升序）：
+     number   纯数字，命中章号                        —— 最确定，排最前
+     exact    章名与查询完全相同
+     prefix   章名以查询开头
+     substr   章名包含查询（越靠前分越高）
+     allchars 查询的每个字都在章名里，顺序不论      —— 「毁尸 毒」也能找到「毒道：毁尸散」
+     subseq   查询是章名的子序列，顺序要对           —— 最宽松的兜底，错字漏字还能捞回来
+
+   ★ 宁可多给几条也别漏：用户是在「我记不清了」的状态下搜的。
+     所以有兜底档，而不是搜不到就空着。
+   ============================================================= */
+(function (root, factory) {
+  const mod = factory();
+  if (typeof module === 'object' && module.exports) module.exports = mod;
+  root.MPToc = mod;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  const LIMIT = 200;
+
+  /**
+   * 归一化：全角→半角、大写→小写、去掉空白和常见标点。
+   * ★ 标点要去：章名里的「：」「·」「，」用户打字时基本不会输，
+   *   留着会让「毒道毁尸散」搜不到「毒道：毁尸散」。
+   */
+  function norm(s) {
+    let out = '';
+    const str = String(s == null ? '' : s);
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i);
+      // 全角 ！(FF01) .. ～(FF5E) → 半角
+      let ch = (c >= 0xFF01 && c <= 0xFF5E) ? String.fromCharCode(c - 0xFEE0)
+        : (c === 0x3000) ? ' ' : str[i];
+      if (/[\s·、，。：；！？“”‘’（）《》〈〉—…,.:;!?"'()\[\]{}\-_/\\|~`@#$%^&*+=]/.test(ch)) continue;
+      out += ch.toLowerCase();
+    }
+    return out;
+  }
+
+  /** 查询的每个字符都出现在 hay 里（各算各的，重复字符要够数） */
+  function allChars(hay, q) {
+    const pool = {};
+    for (const c of hay) pool[c] = (pool[c] || 0) + 1;
+    for (const c of q) {
+      if (!pool[c]) return false;
+      pool[c] -= 1;
+    }
+    return true;
+  }
+
+  /** q 是 hay 的子序列（顺序要对，允许中间隔字） */
+  function subseq(hay, q) {
+    let i = 0;
+    for (let j = 0; j < hay.length && i < q.length; j++) if (hay[j] === q[i]) i += 1;
+    return i === q.length;
+  }
+
+  /**
+   * 搜章节。
+   * @param {Array} chapters [{title}]，下标 + 1 就是章号
+   * @param {String} query
+   * @param {Object} [opts] {limit}
+   * @returns {Array} [{n, title, kind, score}]，已排序
+   */
+  function search(chapters, query, opts) {
+    const o = opts || {};
+    const limit = o.limit == null ? LIMIT : o.limit;
+    const chs = chapters || [];
+    const q = norm(query);
+    if (!q) return [];
+
+    /* 纯数字：先按章号给一档。★ 不 return —— 章名里也可能有这个数字
+       （「第三千章」这种），两边都要给用户看到。 */
+    const asNum = /^\d+$/.test(q) ? parseInt(q, 10) : null;
+    const hits = [];
+
+    for (let i = 0; i < chs.length; i++) {
+      const n = i + 1;
+      const title = (chs[i] && chs[i].title) || '';
+      const hay = norm('第' + n + '章' + title);
+      const tt = norm(title);
+
+      if (asNum !== null && asNum === n) { hits.push({ n: n, title: title, kind: 'number', score: 1000 }); continue; }
+      if (tt && tt === q) { hits.push({ n: n, title: title, kind: 'exact', score: 900 }); continue; }
+      if (tt.indexOf(q) === 0) { hits.push({ n: n, title: title, kind: 'prefix', score: 800 }); continue; }
+      const at = hay.indexOf(q);
+      if (at >= 0) { hits.push({ n: n, title: title, kind: 'substr', score: 700 - Math.min(at, 99) }); continue; }
+      /* ★ 纯数字查询不走宽松档。
+         数字的字符集只有 10 个，随便一个长章号都能把 1/0/2/4 凑齐 ——
+         实测搜「1024」会命中「第406章 132区的十四囚徒」（4和0来自406，1和2来自132）。
+         用户打数字时要的是章号，噪音比漏网难受得多。 */
+      if (asNum !== null) continue;
+
+      /* ★ subseq 必须排在 allchars 前面。
+         「是子序列」蕴含「所有字符都在」，所以 allchars 放前面的话
+         subseq 分支永远执行不到 —— 死代码，而且没有任何测试会发现。
+         顺序也印证了这个次序是对的：顺序对上的匹配，质量本来就比乱序高。 */
+      if (q.length >= 2 && subseq(tt, q)) { hits.push({ n: n, title: title, kind: 'subseq', score: 500 }); continue; }
+      if (q.length >= 2 && allChars(tt, q)) { hits.push({ n: n, title: title, kind: 'allchars', score: 300 }); continue; }
+    }
+
+    hits.sort(function (a, b) { return b.score - a.score || a.n - b.n; });
+    return limit > 0 ? hits.slice(0, limit) : hits;
+  }
+
+  return { search: search, norm: norm, allChars: allChars, subseq: subseq, LIMIT: LIMIT };
+});
+
+</script>
+<script>
 /* ../miniprogram/engine/formats/deps.js */
 /* =============================================================
    deps.js · 格式层对主引擎的唯一依赖入口
@@ -9223,22 +9346,17 @@ function importFrom(input, opts) {
     checkList([['读取文件', 'ok'], ['编码 ' + detect.encoding + ' · 乱码率 0', 'ok'], ['分章', 'run']]);
     setTimeout(function () {
       var t0 = Date.now();
+      /* scanTo:0 —— 同电子书那条路，扫描交给 runInitialScan 分批做 */
       var bk = MPImport.importBook(detect.text, {
         bridge: BRIDGE, split: (opts && opts.split) || 'auto',
-        title: (opts && opts.title) || undefined, today: today(),
+        title: (opts && opts.title) || undefined, today: today(), scanTo: 0,
       });
       bk.meta.encoding = detect.encoding;
       var checks = [
         ['读取文件', 'ok'], ['编码 ' + detect.encoding + ' · 乱码率 0', 'ok'],
         ['分章 ' + bk.meta.chapters + ' 章 · ' + (bk.meta.split === 'heading' ? '按标题' : '固定长度'), 'ok'],
-        [(bk.scannedTo < bk.meta.chapters
-          ? '先处理前 ' + bk.scannedTo + ' 章 · 命中 ' + num(bk.meta.coverage.slots) + ' 处'
-          : '处理全书 ' + bk.meta.chapters + ' 章 · 命中 ' + num(bk.meta.coverage.slots) + ' 处')
-          + ' · ' + (Date.now() - t0) + 'ms', 'ok'],
-        ['放进书架', 'ok'],
       ];
-      checkList(checks);
-      acceptBook(bk, { checks: checks });
+      runInitialScan(bk, checks, t0, {});
     }, 240);
   }, 200);
 }
@@ -9278,6 +9396,54 @@ function curChapter() {
 function gotoRead() { $('phone').classList.remove('wizard'); goto('s-read'); renderChapter(); }
 
 /* C4：读到离已扫边界还剩几章时补扫下一批。 */
+/**
+ * 起步扫描，分批做。
+ * ★ 为什么不能一口气扫完：实测浏览器里扫 20 章要 5.4 秒（Node 里只要 0.11 秒，
+ *   差 50 倍），手机上更久。同步扫的话这几十秒里界面完全冻住 —— 用户看到的就是
+ *   一个不动的转圈，以为「一直在解析」。
+ * ★ 每批之间必须 setTimeout 让出主线程，否则进度条根本画不出来
+ *   （改成同步循环的话，浏览器会把所有 checkList 重绘攒到最后一次性画）。
+ * @param {Object} bk importAny(scanTo:0) 的产物，就地改它的 index/perChapter/scannedTo
+ * @param {Function} onProgress (done, total)
+ * @returns {Promise}
+ */
+/**
+ * 目录里一行显示成什么。
+ * ★ 有的书（尤其 epub）章名本身就带「第N章」，再加一遍前缀就成了
+ *   「第 25 章 · 第25章 毒道：毁尸散」。章号可能有空格、可能用汉字数字，
+ *   所以按「开头是不是第…章/回/节」来判，不逐字比。
+ */
+function chapterLabel(n, title) {
+  var t = String(title || '').trim();
+  if (/^第\s*[0-9０-９一二三四五六七八九十百千万零〇○两]+\s*[章回节话卷幕篇]/.test(t)) return t;
+  return '第 ' + n + ' 章 · ' + t;
+}
+
+function scanInitial(bk, onProgress) {
+  var target = Math.min(MPImport.SCAN_INITIAL, bk.chapters.length);
+  var STEP = 5;
+  return new Promise(function (resolve) {
+    function batch() {
+      var from = (bk.scannedTo || 0) + 1;
+      if (from > target) { resolve(bk); return; }
+      var to = Math.min(target, from + STEP - 1);
+      var scan = MPImport.prescan(bk.chapters, BRIDGE,
+        { from: from, to: to, names: (bk.meta && bk.meta.names) || [] });
+      var merged = MPImport.mergeScan(
+        { index: bk.index, perChapter: bk.perChapter, scannedTo: bk.scannedTo, meta: bk.meta }, scan);
+      bk.index = merged.index;
+      bk.perChapter = merged.perChapter;
+      bk.scannedTo = merged.scannedTo;
+      bk.meta.guards = merged.guards;
+      bk.meta.coverage = { words: merged.words, slots: merged.slots };
+      bk.meta.scannedTo = merged.scannedTo;
+      if (onProgress) { try { onProgress(bk.scannedTo, target); } catch (e) { /* 画进度炸了不该连累导入 */ } }
+      setTimeout(batch, 0);
+    }
+    batch();
+  });
+}
+
 function ensureScanned() {
   var total = S.book.chapters.length;
   var range = MPImport.nextScanRange(S.book.scannedTo || 0, total, S.ch);
@@ -10315,14 +10481,45 @@ function readFile(f) {
   fr.readAsArrayBuffer(f);
 }
 
+/**
+ * 分批跑起步扫描，把进度显示出来，扫完接 acceptBook。
+ * 电子书和 txt 两条导入路都汇到这里。
+ */
+function runInitialScan(bk, items, t0, extra) {
+  var target = Math.min(MPImport.SCAN_INITIAL, bk.chapters.length);
+  var lastPaint = 0;
+  checkList(items.concat([['正在处理前 ' + target + ' 章 · 0/' + target, 'run']]));
+  return scanInitial(bk, function (done, n) {
+    var now = Date.now();
+    if (done < n && now - lastPaint < 150) return;      // 每 150ms 画一次就够
+    lastPaint = now;
+    checkList(items.concat([['正在处理前 ' + n + ' 章 · ' + done + '/' + n, 'run']]));
+  }).then(function () {
+    var line = (bk.scannedTo < bk.meta.chapters
+      ? '先处理前 ' + bk.scannedTo + ' 章 · 命中 ' + num(bk.meta.coverage.slots) + ' 处'
+      : '处理全书 ' + bk.meta.chapters + ' 章 · 命中 ' + num(bk.meta.coverage.slots) + ' 处')
+      + ' · ' + (Date.now() - t0) + 'ms';
+    var full = items.concat([[line, 'ok'], ['放进书架', 'ok']]);
+    checkList(full);
+    acceptBook(bk, Object.assign({ checks: full }, extra || {}));
+  });
+}
+
 /* EPUB / MOBI / AZW / AZW3：结构已经在文件里了，不走标题识别（importAny → importChapters） */
 function importEbook(buf, fileBase) {
   toStep2();
-  checkList([['读取文件', 'ok'], ['解析电子书', 'run']]);
+  /* ★ 这一步是整个导入里最长的一段静默：实测 19 MB 的 epub 解压 + 转文本要 5.3 秒
+     （比后面扫 20 章的 0.44 秒长一个量级）。它是同步的，中途给不出进度 ——
+     spine.forEach 占着主线程，就算回调了 DOM 也不会重绘。
+     所以至少把「在干什么、大概多久」说清楚，别让人对着一个不动的转圈猜。 */
+  var mb = (buf.byteLength / 1048576).toFixed(1);
+  checkList([['读取文件', 'ok'],
+    ['正在解压 ' + mb + ' MB 的电子书' + (buf.byteLength > 5 * 1048576 ? '，大书要几秒' : ''), 'run']]);
   setTimeout(function () {
     var t0 = Date.now(), bk;
     try {
-      bk = MPFormats.importAny(buf, { bridge: BRIDGE, today: today() });
+      /* scanTo:0 —— 只解析切章，扫描交给下面的 scanInitial 分批做，好让进度看得见 */
+      bk = MPFormats.importAny(buf, { bridge: BRIDGE, today: today(), scanTo: 0 });
     } catch (e) {
       // hint 是给读者看的一句话（DRM / 不支持的格式 / 文件坏了），不是异常 message
       checkList([['读取文件', 'ok'], [e.hint || '这个文件读不出来。', 'bad']]);
@@ -10337,15 +10534,9 @@ function importEbook(buf, fileBase) {
         : p.splitMode === 'structure+heading' ? '目录分章 + 大段二次切'
         : p.splitMode === 'global-heading' ? '没有目录，按正文标题分章' : '没有目录，按固定长度分章'), 'ok'],
       ['分章 ' + bk.meta.chapters + ' 章 · ' + num(bk.meta.chars) + ' 字', 'ok'],
-      [(bk.scannedTo < bk.meta.chapters
-        ? '先处理前 ' + bk.scannedTo + ' 章 · 命中 ' + num(bk.meta.coverage.slots) + ' 处'
-        : '处理全书 ' + bk.meta.chapters + ' 章 · 命中 ' + num(bk.meta.coverage.slots) + ' 处')
-        + ' · ' + (Date.now() - t0) + 'ms', 'ok'],
     ];
     (p.warnings || []).slice(0, 3).forEach(function (w) { items.push([w, 'warn']); });
-    items.push(['放进书架', 'ok']);
-    checkList(items);
-    acceptBook(bk, { checks: items, author: p.author });
+    runInitialScan(bk, items, t0, { author: p.author });
   }, 200);
 }
 $('file-input').onchange = function () { readFile(this.files && this.files[0]); };
@@ -10439,6 +10630,9 @@ $('dens-seg').onclick = function (e) {
   if ($('s-prog').classList.contains('on')) paintProg();
 };
 $('toc-open').onclick = function () { closeSheets(); openToc(); };
+/* 输入即搜。★ 不做防抖：1800 章的匹配实测 1ms 级，防抖反而让人觉得卡手。
+   真正贵的是 MPDiff.bookChapters（难度表），它在 paintToc 里每次都算 —— 见 openToc 的缓存。 */
+$('toc-q').addEventListener('input', function () { paintToc(); });
 $('path-open').onclick = function () { closeSheets(); goto('s-path'); };
 
 /* 调试面板 */
@@ -10602,6 +10796,9 @@ $('wel-start').onclick = function () {
    「难度标签按你的已掌握词表实时算，同一章对不同人显示不同结果。」判断全在 difficulty.js。
    ============================================================= */
 function openToc() {
+  /* ★ 每次进来清空搜索 —— 不然上次搜完留在框里，一进目录看到的是搜索结果，
+     「接着读」那张大卡不见了，会让人以为目录坏了。 */
+  if ($('toc-q')) $('toc-q').value = '';
   paintToc();
   goto('s-toc');
   /* ★ 必须在 goto 之后滚：#s-toc 还是 display:none 的时候 getBoundingClientRect 全是 0。 */
@@ -10634,12 +10831,38 @@ function paintToc() {
   $('toc-filter').classList.toggle('on', S.profile.only_seen);
   var body = $('toc-body'); body.innerHTML = '';
 
+  /* ---- 搜索态：只画命中的行，不画「接着读」大卡 ----
+     换了设备之后想找回上次读到哪，靠的就是这里：记得章名搜章名，记得章号搜章号。 */
+  var q = ($('toc-q') && $('toc-q').value || '').trim();
+  if (q) {
+    var hits = MPToc.search(S.book.chapters, q, { limit: 200 });
+    var note = el('p', 'lbl'); note.style.margin = '0 0 12px';
+    note.textContent = hits.length
+      ? '找到 ' + hits.length + ' 章' + (hits.length >= 200 ? '（只列前 200 条，再打几个字缩小范围）' : '')
+      : '没找到。试试只打章名里记得的那两个字，或者直接打章号。';
+    body.appendChild(note);
+    hits.forEach(function (h) {
+      var st = list[h.n - 1] || {};
+      var row = el('div', 'chrow' + (h.n === S.ch ? ' cur' : ''));
+      var main = el('div', 'main');
+      main.appendChild(el('div', 't', chapterLabel(h.n, h.title)));
+      main.appendChild(el('div', 'm', st.scanned
+        ? ((Math.round(st.unknownRate * 1000) / 10) + '% 生词 · ' + st.replaceCount + ' 个替换词 · ' + st.minutes + '′')
+        : '还没处理到，读到这里会自动补上'));
+      row.appendChild(main);
+      if (st.band) row.appendChild(bandTag(st));
+      row.onclick = function () { S.ch = h.n; save(); goto('s-read'); renderChapter(); };
+      body.appendChild(row);
+    });
+    return;
+  }
+
   var nextN = Math.min(S.ch, list.length);
   var cur = list[nextN - 1];
   var big = el('div', 'chnext');
   big.appendChild(el('div', 'eyebrow', S.ch === 1 ? '第一章' : '接着读'));
   var hd = el('div'); hd.style.cssText = 'display:flex;align-items:baseline;justify-content:space-between;gap:10px';
-  hd.appendChild(el('h2', null, '第 ' + nextN + ' 章 · ' + S.book.chapters[nextN - 1].title));
+  hd.appendChild(el('h2', null, chapterLabel(nextN, S.book.chapters[nextN - 1].title)));
   hd.appendChild(bandTag(cur));
   big.appendChild(hd);
   var nums = el('div', 'nums');
@@ -10666,7 +10889,7 @@ function paintToc() {
   list.forEach(function (st, i) {
     var row = el('div', 'chrow' + (i + 1 === S.ch ? ' cur' : ''));
     var main = el('div', 'main');
-    main.appendChild(el('div', 't', '第 ' + (i + 1) + ' 章 · ' + S.book.chapters[i].title));
+    main.appendChild(el('div', 't', chapterLabel(i + 1, S.book.chapters[i].title)));
     main.appendChild(el('div', 'm', st.scanned
       ? ((Math.round(st.unknownRate * 1000) / 10) + '% 生词 · ' + st.replaceCount + ' 个替换词 · ' + st.minutes + '′')
       : '还没处理到，读到这里会自动补上'));
