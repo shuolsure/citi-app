@@ -1,5 +1,5 @@
 /* 词替 · Service Worker —— 由 tools/build-pwa.mjs 生成，别手改 */
-const CACHE = 'citi-64220f0d106a';
+const CACHE = 'citi-fa2506c102ac';
 
 /* ★ 这里绝不能出现 './' —— 目录路径在有的静态服务器上返回 index.html、
      在有的上面返回 404，而 addAll 是原子的：一个 404 就让整个 install 失败，
