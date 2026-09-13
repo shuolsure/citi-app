@@ -307,9 +307,15 @@ w.open>.on{color:var(--ink)}
 .wpop .acts button{border:0;background:none;padding:0;font:400 12px/1.6 var(--font);color:var(--foot);cursor:pointer}
 
 /* 章末结算（v14 08 屏）：只报「你自己做过的事」 */
+/* 连续滚动：每章一个 .chseg。改造前一次只渲染一章，标题和正文是两个固定元素。 */
+.chseg{display:block}
+.chtitle{margin:0 0 18px;font:600 21px/1.4 var(--font);color:var(--ink);text-indent:0}
+.chseg + .chseg .chtitle{margin-top:8px}
+.chend{text-indent:0}
+
 /* 章节分隔。★ 这里曾经是一整屏结算（时长/积分/勋章 + 一个必须点的「继续读」按钮）。
    小说读到一章末尾该做的事只有一件：让人知道章断了，然后继续。 */
-.chend-line{height:1px;background:var(--line,rgba(0,0,0,.08));margin:26px 0 18px}
+.chend-line{height:1px;background:var(--line,rgba(0,0,0,.08));margin:30px 12% 34px}
 .chend-t{font:500 14px/1.5 var(--font);color:var(--muted);text-align:center;
   padding-bottom:40px}
 
@@ -794,10 +800,9 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
       <button class="iconbtn" id="read-set"><svg class="ic"><use href="#i-set"/></svg></button>
     </div>
     <div class="scroll" id="read-scroll">
-      <h2 class="chapter-h" id="chapter-h">—</h2>
+      <!-- 连续滚动：每章是一个 .chseg，自带标题、正文和章末分隔。
+           改造前这里是「固定的标题 + 正文 + 章末结算」三件套，一次只装一章。 -->
       <div id="read-body"></div>
-      <!-- 章末结算（v14 08 屏）：排在最后一段之后，不靠滚动事件「揭示」 -->
-      <div id="chapter-end" class="settle"></div>
     </div>
     <div class="readfoot" id="read-foot">
       <span id="prog-note">点词看释义</span>
@@ -8662,6 +8667,7 @@ var S = {
   ladder: {},                // 三档梯子（ladder.js）。只是缓存：从事件可重放（I4）
   rollup: null,              // 被截掉的事件折成的检查点 {t, first, userWords, ladder, prog}
   ch: 1, gch: 1, history: [], gone: [], unscanned: [], lastRender: null,
+  renders: {},              // gch → 那一章的渲染结果（连续滚动时同时存在好几章）
   shelf: [],                 // 书架索引（不含正文；条目结构见 shelf.js entryOf）
   userLibrary: [],           // 主理人自己传进书库的书（本地演示；真产品里这是服务端的）
   detail: null,              // 详情页正在看的书
@@ -10170,12 +10176,24 @@ function scanAhead() {
  * 进入一章（每次都重算，绝不缓存 —— S8）。
  * @param {Object} [o] {keepScroll} 同一章里改设置 / 否决一个词之后重画，别把人弹回章首
  */
-function renderChapter(o) {
-  var opt = o || {};
-  var keepTop = opt.keepScroll ? $('read-scroll').scrollTop : 0;
-  flushClock();                               // 上一段阅读时长记到上一章头上
-  ensureScanned();                            // 当前章必须已扫（同步，通常 0–2 章）
-  scanAhead();                                // 后面的在背后慢慢扫，不挡这一次渲染
+/* =============================================================
+   连续滚动的渲染
+   -------------------------------------------------------------
+   改造前一次只渲染一章，「当前章」和「屏幕上那一章」是同一件事。
+   连续滚动之后这两件事分开了 —— 视口里可能同时有第 5 章的末尾和第 6 章的开头。
+   曝光口径写在 doc/06-连续滚动的曝光口径.md，那份是这段代码的判据来源。
+
+   ★ 每一章渲染出一个 <section.chseg>，自带 data-gch。
+     所有「这个词当时长什么样、什么档位」的查询都按段落上的 gch 去
+     S.renders 里找 —— **不能用 S.lastRender**，那是「当前章」，
+     多章并存时会把第 5 章的词记上第 6 章的档位（E6）。
+   ============================================================= */
+
+/** 算一章：候选、选词、替换、档位。不碰 DOM，不碰全局状态（除了 S.gone/S.unscanned）。 */
+function computeChapter(ch, gch) {
+  var save_ch = S.ch, save_gch = S.gch;
+  S.ch = ch; S.gch = gch;                 // 下面那段原样沿用旧逻辑，它读 S.ch/S.gch
+  try {
   var chapter = curChapter();
   var key = visitKey();
   settleLadder(key);                          // 上一章的访问结算 → 隐式作答 → 词状态（先于调度）
@@ -10223,37 +10241,202 @@ function renderChapter(o) {
   var tiered = MPLadder.annotate(r.replaced, S.ladder, key, Date.now(), ladderOpts());
   // 顶栏「关英文」：这一遍不替换，读纯中文原文。替换位算过了但不渲染，也就不记任何信号。
   if (S.englishOff) tiered = [];
-  S.lastRender = { chapter: chapter, parsed: r.parsed, replaced: tiered, plan: plan,
-    dropped: r.dropped, quota: r.quota, cands: cands.length, density: dens, key: key,
-    book: S.book.meta.id, ch: S.ch, gch: S.gch, all: r.replaced.length };
+    /* ★ key 必须走 visitKey()：默认的千字时钟下它是**学习窗口**的 key，
+       不是「书#章#章次」。自己拼一个 book#ch#gch 会让梯子的访问归拢整个错位。 */
+    var key = visitKey();
+    var tiered2 = MPLadder.annotate(r.replaced, S.ladder, key, Date.now(), ladderOpts());
+    if (S.englishOff) tiered2 = [];
+    return { chapter: chapter, parsed: r.parsed, replaced: tiered2, plan: plan,
+      dropped: r.dropped, quota: r.quota, cands: cands.length, density: dens, key: key,
+      book: S.book.meta.id, ch: ch, gch: gch, all: r.replaced.length };
+  } finally { S.ch = save_ch; S.gch = save_gch; }
+}
 
-  // ★ 用 segments.js 建 DOM —— 小程序里这一步是 wxml 的两层 wx:for，判断完全相同
-  var segs = MPSeg.toSegments(r.parsed, tiered, S.userWords);
+/** 把一章建成一个 <section.chseg>。 */
+function buildChapterSeg(ch, gch) {
+  var R = computeChapter(ch, gch);
+  S.renders[gch] = R;
+
+  var seg = el('section', 'chseg');
+  seg.dataset.ch = ch; seg.dataset.gch = gch;
+
+  var h = el('h2', 'chtitle');
+  h.textContent = chapterLabel(ch, S.book.chapters[ch - 1].title);
+  seg.appendChild(h);
+
+  var segs = MPSeg.toSegments(R.parsed, R.replaced, S.userWords);
+  segs.forEach(function (pp) {
+    var para = el('p');
+    para.dataset.p = pp.i;
+    para.dataset.gch = gch;               // ★ 曝光按它归属（E4/E5）
+    pp.nodes.forEach(function (n) {
+      if (n.k === 't') { para.appendChild(document.createTextNode(n.s)); return; }
+      para.appendChild(wordNode(n));
+    });
+    seg.appendChild(para);
+  });
+
+  var end = el('div', 'chend');
+  end.dataset.gch = gch;
+  var lastCh = ch >= S.book.chapters.length;
+  end.appendChild(el('div', 'chend-line'));
+  /* ★ 连续滚动下不预告下一章 —— 它的标题就在这条线下面三行的地方，
+     再写一遍是把同一句话说两次。只有最后一章需要一句收尾。 */
+  if (lastCh) end.appendChild(el('div', 'chend-t', '《' + S.book.meta.title + '》读完了'));
+  seg.appendChild(end);
+
+  R.exposure = MPSeg.exposureMap(segs);
+  return seg;
+}
+
+/** 整屏重画：跳章、换书、改设置走这条。 */
+function renderChapter(o) {
+  var opt = o || {};
+  var keepTop = opt.keepScroll ? $('read-scroll').scrollTop : 0;
+  flushClock();
+  ensureScanned();
+  scanAhead();
+  settleLadder(visitKey());               // 上一次访问的结算
+
+  S.renders = {};
   var body = $('read-body');
   body.innerHTML = '';
   body.classList.remove('peek');
   body.style.fontSize = S.profile.font + 'px';
-  var frag = document.createDocumentFragment();
-  segs.forEach(function (p) {
-    var para = el('p'); para.dataset.p = p.i;
-    p.nodes.forEach(function (n) {
-      if (n.k === 't') { para.appendChild(document.createTextNode(n.s)); return; }
-      para.appendChild(wordNode(n));
-    });
-    frag.appendChild(para);
-  });
-  body.appendChild(frag);
+  body.appendChild(buildChapterSeg(S.ch, S.gch));
+  S.lastRender = S.renders[S.gch];
 
-  $('chapter-h').textContent = chapter.title;
-  $('read-crumb').querySelector('.sub').textContent =
-    S.book.meta.title + ' · 第 ' + S.ch + '/' + S.book.chapters.length + ' 章';
   $('read-scroll').scrollTop = keepTop;
   closePop();
-  updateProgress();
-  paintSettle();
-  watchExposure(MPSeg.exposureMap(segs));
+  syncChapterUI();
+  watchExposure();
   watchSettle();
   if ($('s-read').classList.contains('on')) startClock();
+}
+
+/**
+ * 往下接一章。★ 这是连续滚动的核心：**不清空、不改 scrollTop**，
+ * 所以读者手上的那一下滑动不会被打断。
+ *
+ * ★ 调用前 S.ch / S.gch 必须已经推进到新章（advanceChapter 负责），
+ *   而且上一章要已经结算过 —— 因为档位依赖「已读千字」，
+ *   先算后结算的话，新章会拿着上一章的旧时钟，档位整章滞后。
+ *   这个顺序和改造前「finishChapter → nextChapter → renderChapter」一致。
+ */
+function appendNextChapter() {
+  if (!S.book) return false;
+  ensureScanned();                        // 这一章必须已扫（用刚推进的 S.ch）
+  scanAhead();
+  $('read-body').appendChild(buildChapterSeg(S.ch, S.gch));
+  S.lastRender = S.renders[S.gch];        // ★ 「当前章」跟着走，12 处引用都靠它
+  pruneSegs();
+  watchExposure();
+  syncChapterUI();
+  return true;
+}
+
+function segList() { return Array.prototype.slice.call($('read-body').querySelectorAll('.chseg')); }
+function maxLoadedCh() {
+  var l = segList();
+  return l.length ? Number(l[l.length - 1].dataset.ch) : S.ch;
+}
+function maxLoadedGch() {
+  var l = segList();
+  return l.length ? Number(l[l.length - 1].dataset.gch) : S.gch;
+}
+
+/**
+ * DOM 里最多留 MAX_SEGS 章，多的从**前面**摘掉。
+ * ★ 摘掉之后必须把 scrollTop 减去它的高度，否则内容会当场向上跳一大截。
+ */
+var MAX_SEGS = 5;
+
+/**
+ * 往上接一章。★ 往回滚时用 —— 只往下接的话，摘掉的章回不来，
+ * 读者往回翻会撞上内容尽头，像书被撕了。
+ * ★ 接完必须把 scrollTop 加上新内容的高度，否则眼前的字会当场向下窜一大截。
+ * ★ gch 用「原来那一次的章次」（first - 1），不是新开一次 ——
+ *   所以重新滚回来不会重复记曝光（E7）。
+ */
+function prependPrevChapter() {
+  var l = segList();
+  if (!l.length || !S.book) return false;
+  var first = l[0];
+  var ch = Number(first.dataset.ch) - 1;
+  var gch = Number(first.dataset.gch) - 1;
+  if (ch < 1 || gch < 1) return false;
+  var sc = $('read-scroll');
+  var before = sc.scrollHeight;
+  $('read-body').insertBefore(buildChapterSeg(ch, gch), first);
+  sc.scrollTop += sc.scrollHeight - before;      // 补偿：视觉上纹丝不动
+  pruneSegs();
+  watchExposure();
+  syncChapterUI();
+  return true;
+}
+
+/**
+ * DOM 里最多留 MAX_SEGS 章，从**离视口远的那一端**摘。
+ * ★ 一律摘前面的话，往回滚时会边滚边被摘掉，越滚越没得看。
+ * ★ 摘前面要把 scrollTop 减去它的高度，摘后面不用（内容在下方）。
+ */
+function pruneSegs() {
+  var sc = $('read-scroll');
+  while (segList().length > MAX_SEGS) {
+    var cur = segList();
+    var vis = visibleCh();
+    var i = -1;
+    for (var k = 0; k < cur.length; k++) if (Number(cur[k].dataset.ch) === vis) { i = k; break; }
+    if (i < 0) i = cur.length - 1;
+    if (i >= cur.length - 1 - i) {
+      var first = cur[0];                        // 视口靠后 → 摘最前面
+      var h = first.offsetHeight;
+      first.remove();
+      sc.scrollTop = Math.max(0, sc.scrollTop - h);
+    } else {
+      cur[cur.length - 1].remove();              // 视口靠前 → 摘最后面
+    }
+    /* ★ 曝光的去重表**不清**（E7）：同一个 gch 滚回来也不该重复记。 */
+  }
+  /* ★ 渲染结果要跟着回收，否则读一千章就攒一千份 parsed/replaced，内存直接爆。
+     多留几章的余量：曝光是 1.5 秒后才落的，刚摘掉的那一章可能还有计时器挂着，
+     R 被删会让那几条曝光凭空消失（而且不报错）。 */
+  /* ★ 回收要按「离还在 DOM 里的那几章有多远」来判，不能从最小的开始删：
+     往回滚时新接进来的是**小** gch，而该删的是刚被摘掉的**大** gch ——
+     从小的开始删一个都删不掉，renders 会一路涨上去（实测滚 16 次涨到 12 份）。 */
+  var live = segList().map(function (sg) { return Number(sg.dataset.gch); });
+  if (!live.length) return;
+  var lo = Math.min.apply(null, live), hi = Math.max.apply(null, live);
+  Object.keys(S.renders).forEach(function (k) {
+    var g = Number(k);
+    /* 上下各留 2 章的余量：曝光是 1.5 秒后才落的，刚摘掉那一章可能还有
+       计时器挂着，R 被删会让那几条曝光凭空消失，而且不报错。 */
+    if (g < lo - 2 || g > hi + 2) delete S.renders[k];
+  });
+}
+
+/**
+ * 视口顶部是哪一章（E9）。
+ * ★ 它和 S.ch 是两件事：S.ch 是「读到哪了」（跟着加载推进，书架进度、
+ *   结算、里程表都用它）；这个是「现在眼睛落在哪一章」，只用来显示。
+ *   往回滚看前一章时，顶栏该跟着变，但「读到哪了」不该倒退。
+ */
+function visibleCh() {
+  var segs = segList();
+  if (!segs.length) return S.ch;
+  var top = $('read-scroll').getBoundingClientRect().top + 60;
+  for (var i = segs.length - 1; i >= 0; i--) {
+    if (segs[i].getBoundingClientRect().top <= top) return Number(segs[i].dataset.ch);
+  }
+  return Number(segs[0].dataset.ch);
+}
+
+/** 顶栏章号 / 进度条。 */
+function syncChapterUI() {
+  if (!S.book) return;
+  $('read-crumb').querySelector('.sub').textContent =
+    S.book.meta.title + ' · 第 ' + visibleCh() + '/' + S.book.chapters.length + ' 章';
+  updateProgress();
 }
 
 function updateProgress() {
@@ -10266,30 +10449,50 @@ function updateProgress() {
 /* 曝光判定：段落停留 ≥1.5s 才记。小程序里是 wx.createIntersectionObserver。
    ★ 事件带上**渲染出来的档位**（tier）：梯子结算、证据段的分母都以读者看到的那个样子为准。 */
 var _io = null, _timers = {};
-function watchExposure(map) {
+/**
+ * 曝光观察。口径见 doc/06-连续滚动的曝光口径.md。
+ *
+ * ★ E4/E5：去重键是「该章的 key + 段落序号」，不是光段落序号 ——
+ *   多章并存时，第 6 章的第 3 段会因为第 5 章的第 3 段记过而被跳掉，且不报错。
+ * ★ E6：expr / tier 从**该段落所属章**的渲染结果取，不是 S.lastRender
+ *   （那是「当前章」）—— 否则第 5 章的词被记上第 6 章的档位。
+ * ★ E7：去重表 _counted 跨渲染保留，章滚出 DOM 再滚回来不重复记。
+ *   真正重读会拿到新的 gch（章次），那时才重新记。
+ */
+var _counted = {};
+function watchExposure() {
   if (_io) _io.disconnect();
   for (var k in _timers) clearTimeout(_timers[k]);
   _timers = {};
-  var counted = {};
   _io = new IntersectionObserver(function (entries) {
     entries.forEach(function (en) {
       var pi = en.target.dataset.p;
-      if (!map[pi]) return;
+      var gch = en.target.dataset.gch;
+      if (pi == null || gch == null) return;
+      var R = S.renders[gch];
+      if (!R || !R.exposure || !R.exposure[pi]) return;
+      var ck = R.key + '#' + R.ch + '#' + gch + '#' + pi;
       if (en.isIntersecting) {
-        if (counted[pi]) return;
-        _timers[pi] = setTimeout(function () {
-          if (counted[pi]) return;
-          counted[pi] = 1;
-          map[pi].forEach(function (id) {
-            var hit = (S.lastRender.replaced.find(function (x) { return x.word_id === id; }) || {});
-            emit({ kind: 'expose', word_id: id, expr: hit.expr, tier: hit.tier });
+        if (_counted[ck]) return;
+        _timers[ck] = setTimeout(function () {
+          if (_counted[ck]) return;
+          _counted[ck] = 1;
+          R.exposure[pi].forEach(function (id) {
+            var hit = (R.replaced.find(function (x) { return x.word_id === id; }) || {});
+            /* ★ keep=true 并自己填 book/ch/gch：emit 默认会拿**当前**的 S.ch/S.gch
+               覆盖归属，而词状态 apply() 就是拿 ev.gch 当 curChapter 的 —— 
+               不自己填，第 5 章的曝光会被算进第 6 章。 */
+            emit({ kind: 'expose', word_id: id, expr: hit.expr, tier: hit.tier,
+              book: R.book, ch: R.ch, gch: R.gch }, true);
           });
           save();
         }, 1500);
-      } else if (_timers[pi]) { clearTimeout(_timers[pi]); delete _timers[pi]; }
+      } else if (_timers[ck]) { clearTimeout(_timers[ck]); delete _timers[ck]; }
     });
   }, { root: $('read-scroll'), threshold: 0.35 });
-  Array.prototype.forEach.call($('read-body').children, function (p) { _io.observe(p); });
+  Array.prototype.forEach.call($('read-body').querySelectorAll('.chseg p'), function (p) {
+    _io.observe(p);
+  });
 }
 
 /* -------------------------------------------------------------
@@ -10331,11 +10534,18 @@ document.addEventListener('visibilitychange', function () {
   else CLOCK.last = Date.now();
 });
 window.addEventListener('pagehide', function () { flushClock(); save(); });
+var _uiTick = false;
 $('read-scroll').addEventListener('scroll', function () {
   touch();
-  /* 只在阅读页里管用 */
   if (!$('s-read').classList.contains('on')) return;
   if (atBottom()) advanceChapter();
+  else if ($('read-scroll').scrollTop < 200) prependPrevChapter();
+  /* 顶栏跟着视口走。★ 每帧最多算一次 —— visibleCh 要读 rect，
+     每个 scroll 事件都算会在长列表上掉帧。 */
+  if (!_uiTick) {
+    _uiTick = true;
+    requestAnimationFrame(function () { _uiTick = false; syncChapterUI(); });
+  }
 }, { passive: true });
 
 /* -------------------------------------------------------------
@@ -10385,28 +10595,8 @@ function showExitBar() {
      没点开什么都说明不了，算进去「87% 没点开」会被撑高，而且不报错。
    ★ 勋章卡受 G7 管：一次阅读会话最多一次，冷启动的第一屏不出。
    ------------------------------------------------------------- */
-function paintSettle() {
-  /* ★ 这里原来是一整屏结算：读了多少分钟、多少词没点开、积分、勋章，
-     还有一个「继续读第 N 章」的按钮 —— 读者必须点它才能往下读。
-     那是在一本小说的每一章末尾插一段广告，然后要求读者鼓掌。
-     现在只留一条分隔和下一章的标题：看得出章断了，滑过去就继续。
-     统计没有消失，它们在「进展」页；该记的事件照旧在滚过这里时记。 */
-  var box = $('chapter-end'); box.innerHTML = '';
-  if (!S.book) return;
-  var last = S.ch >= S.book.chapters.length;
-
-  if (last) {
-    box.appendChild(el('div', 'chend-line'));
-    box.appendChild(el('div', 'chend-t', '《' + S.book.meta.title + '》读完了'));
-    var go = el('button', 'btn go'); go.style.marginTop = '14px';
-    go.appendChild(el('span', null, '看看读了些什么'));
-    go.onclick = function () { markVanity(); leaveReading('s-prog'); };
-    box.appendChild(go);
-    return;
-  }
-  box.appendChild(el('div', 'chend-line'));
-  box.appendChild(el('div', 'chend-t', chapterLabel(S.ch + 1, S.book.chapters[S.ch].title)));
-}
+/* paintSettle 退役：章末不再是一块要「画」的东西，
+   它是每个 .chseg 末尾的一条分隔（见 buildChapterSeg）。 */
 /** 结算页的那张勋章卡：刚拿到的优先；没有就给离得最近的那一枚的进度。都不合适就不给。 */
 function medalCard(dg, sm) {
   var list = MPProg.medals(dg, medalCtx()), byId = {};
@@ -10439,7 +10629,7 @@ function medalCard(dg, sm) {
 function markVanity() {
   var R = S.lastRender;
   if (!S.sess || !R) return;
-  if (!$('chapter-end').querySelector('.mcard.vain')) return;
+  if (true) return;      // 虚荣卡随章末结算一起退役了
   S.sess.vanityShown = true; S.sess.vanityKey = R.key; S.sess.fresh = [];
 }
 /* 结算页滚进来的时候刷新一次（时长在涨），并认定「这一程的那一次」已经用掉了 */
@@ -10472,24 +10662,33 @@ function atBottom() {
   if (sc.scrollHeight <= sc.clientHeight + 8) return false;
   return sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 8;
 }
+var lastAdvance = 0;
 function advanceChapter() {
   if (advancing || !S.book) return false;
-  if (S.ch >= S.book.chapters.length) return false;      // 最后一章不自动翻
+  /* ★ 接一章之后如果内容还是不够一屏，下一个 scroll 事件会立刻又接一章。
+     那本身没错（内容不够就该多接），但要有个下限，免得一次滑动惯性
+     把十几章一口气接进来。 */
+  if (Date.now() - lastAdvance < 400) return false;
+  if (S.ch >= S.book.chapters.length) return false;      // 最后一章不再往下接
   advancing = true;
   markVanity();
-  finishChapter();
+  finishChapter();          // 结算刚读完的这一章（里程表在这里推进）
+  S.ch += 1; S.gch += 1;    // 推进到下一章
   save();
-  nextChapter();            // 里面会 renderChapter → watchSettle → advancing 归零
+  appendNextChapter();      // ★ 接上去，不清空、不动 scrollTop
+  lastAdvance = Date.now();
+  advancing = false;
   return true;
 }
 function watchSettle() {
   if (_ioEnd) { _ioEnd.disconnect(); _ioEnd = null; }
   advancing = false;
-  /* 章末那行字可以点 —— 给「这一章短得不用滚」和「想快点翻」的人一个入口。 */
-  var t = $('chapter-end').querySelector('.chend-t');
-  if (t && S.book && S.ch < S.book.chapters.length) {
-    t.style.cursor = 'pointer';
-    t.onclick = function () { advanceChapter(); };
+  /* 短到不用滚的章接不上下一章（atBottom 对它恒假），给分隔线一个点击入口兜底。 */
+  var lines = $('read-body').querySelectorAll('.chend-line');
+  var ln = lines[lines.length - 1];
+  if (ln && S.book && S.ch < S.book.chapters.length) {
+    ln.style.cursor = 'pointer';
+    ln.onclick = function () { advanceChapter(); };
   }
 }
 
@@ -10549,7 +10748,11 @@ function openPop(w) {
   if (!word) return;
   closePop();
   var before = S.events.filter(function (e) { return e.kind === 'lookup' && e.tier != null; }).length;
-  POP = { id: id, off: Number(w.dataset.off), node: w, tier: tier };
+  /* ★ 记下这个词属于哪一章：连续滚动时视口里同时有好几章，
+     只凭 offset 去 S.lastRender 里找会找到另一章的同位置词。 */
+  var seg = w.closest ? w.closest('.chseg') : null;
+  POP = { id: id, off: Number(w.dataset.off), node: w, tier: tier,
+    gch: seg ? Number(seg.dataset.gch) : S.gch };
   w.classList.add('open');
   touch();
   emit({ kind: 'lookup', word_id: id, tier: tier, inline: true });
@@ -10565,7 +10768,6 @@ function openPop(w) {
   $('wp-note-t').textContent = note || '';
   $('wpop').classList.add('on');
   $('wpop-mask').classList.add('on');
-  paintSettle();
 }
 function closePop() {
   if (POP && POP.node) POP.node.classList.remove('open');
@@ -10584,7 +10786,8 @@ $('wp-skip').onclick = function () {
 };
 $('wp-name').onclick = function () {
   if (!POP) return;
-  var hit = S.lastRender.replaced.find(function (x) { return x.offset === POP.off; });
+  var R = S.renders[POP.gch] || S.lastRender;
+  var hit = R.replaced.find(function (x) { return x.offset === POP.off; });
   if (hit) {
     if (S.book.meta.names.indexOf(hit.expr) < 0) S.book.meta.names.push(hit.expr);
     emit({ kind: 'mark_name', value: hit.expr });
@@ -10636,7 +10839,12 @@ function peekOn() {
     if (cy < box.top || cy >= mid) return;
     if (seen[w.dataset.id]) return;
     seen[w.dataset.id] = 1;
-    emit({ kind: 'peek', word_id: w.dataset.id, tier: Number(w.dataset.tier) });
+    /* ★ 归属该词所在那一章，不是「当前章」（同 expose，见 doc/06） */
+    var sg = w.closest ? w.closest('.chseg') : null;
+    var pr = sg ? S.renders[sg.dataset.gch] : null;
+    emit({ kind: 'peek', word_id: w.dataset.id, tier: Number(w.dataset.tier),
+      book: pr ? pr.book : (S.book && S.book.meta.id), ch: pr ? pr.ch : S.ch,
+      gch: pr ? pr.gch : S.gch }, !!pr);
   });
   /* 一屏里一个档 1 都没有时，长按在画面上是纹丝不动的（档 2/3 本来就带中文）。
      不说一句就是「按了没反应」—— 这是这次改动带出来的唯一一处新状态。 */
@@ -10659,7 +10867,6 @@ function peekOff() {
   HOLD.on = false;
   $('read-body').classList.remove('peek');
   show($('hold-pill'), false);
-  paintSettle();
 }
 (function () {
   var area = $('read-scroll');
@@ -12121,7 +12328,7 @@ window.__demo = {
     (S.lastRender ? S.lastRender.replaced : []).forEach(function (x) {
       emit({ kind: 'expose', word_id: x.word_id, expr: x.expr, tier: x.tier });
     });
-    save(); paintSettle(); return Object.keys(S.userWords).length;
+    save(); return Object.keys(S.userWords).length;
   },
   /** 点第 i 个替换词（打开浮层 = 一次 lookup） */
   tap: function (i) {
@@ -12137,7 +12344,7 @@ window.__demo = {
   read: function (min) {
     var R = S.lastRender;
     emit({ kind: 'read_time', ms: Math.round((min || 1) * 60000), book: R.book, ch: R.ch, gch: R.gch }, true);
-    save(); paintSettle();
+    save();
   },
   finishChapter: function () { finishChapter(); save(); },
   next: nextChapter,
