@@ -5891,6 +5891,39 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
     return !!entry.need_text;                           // 在等用户重新导入
   }
 
+  /**
+   * 从「存储里有正文、书架上却没有」的书恢复条目。
+   *
+   * ★ 为什么需要：书架索引和正文分开存（索引在 localStorage、正文在 IndexedDB），
+   *   任何让索引丢失的意外 —— 写盘时机不对、存储被清了一半、装载没完成就被存了一次空的 ——
+   *   都会让书架空掉。而正文还好端端躺在那儿。
+   *   没有这一步，下一次 gc 就会拿空书架当真相，把正文也删了：**数据彻底没了**。
+   *   有了这一步，最坏情况只是「书架顺序乱了」，书还在。
+   *
+   * ★ 主动删掉的书不会被恢复回来 —— 删除走 delBody，正文和索引一起没，
+   *   所以「有正文没条目」一定是异常状态，恢复它是对的。
+   *
+   * @param {Array} shelf 现有书架
+   * @param {Object} heads {id: 书头}，书头里有 meta
+   * @param {Object} haveText {id:true} 哪些书的正文真的在
+   * @returns {Object} {shelf, recovered:[标题…]}
+   */
+  function recoverOrphans(shelf, heads, haveText) {
+    const known = Object.create(null);
+    (shelf || []).forEach((x) => { if (x && x.id) known[x.id] = 1; });
+    const have = haveText || {};
+    let out = (shelf || []).slice();
+    const recovered = [];
+    Object.keys(heads || {}).forEach((id) => {
+      if (known[id] || !have[id]) return;
+      const h = heads[id];
+      if (!h || !h.meta) return;
+      out = upsert(out, entryOf({ meta: h.meta, chapters: [] }, {}));
+      recovered.push(h.meta.title || id);
+    });
+    return { shelf: out, recovered: recovered };
+  }
+
   function remove(shelf, id) { return (shelf || []).filter((x) => x.id !== id); }
 
   function find(shelf, id) { return (shelf || []).filter((x) => x.id === id)[0] || null; }
@@ -5955,7 +5988,7 @@ html.has-safe-top .statusbar>span:first-child{visibility:hidden}
     CHUNK: CHUNK, SHELF_MAX: SHELF_MAX,
     chunk: chunk, createStore: createStore,
     webAdapter: webAdapter, memAdapter: memAdapter,
-    entryOf: entryOf, upsert: upsert, remove: remove, find: find, claimByTitle: claimByTitle, keepable: keepable,
+    entryOf: entryOf, upsert: upsert, remove: remove, find: find, claimByTitle: claimByTitle, keepable: keepable, recoverOrphans: recoverOrphans,
     touch: touch, sorted: sorted, progress: progress,
   };
 });
@@ -8666,6 +8699,7 @@ var HEADS = {};                     // id → 书头（bidx），内存镜像
 var HASTEXT = {};                   // id → true，这本书的正文在不在
 var idbWarn = null;                 // IDB 打不开时的人话（隐私模式/存储被禁）
 var migrateNote = null;             // 这次启动搬了几本书，搬完提示一次
+var recoverNote = null;             // 这次启动从存储里找回了几本书
 
 /* 存储占用。★ 异步取（navigator.storage.estimate），书架渲染是同步的，
    所以显示的是上一次取到的值 —— 刚导完书会慢一拍，比让整个书架等着强。 */
@@ -9005,9 +9039,16 @@ function rollupBase() {
 /* ★ 清档时 location.reload() 会触发 pagehide → save()，把刚清掉的状态原样写回去 ——
    「清除本地数据」按了等于没按，而且不报错。清档前立这个旗，之后一切写盘都跳过。 */
 var RESETTING = false;
+/* ★ 装载没完成之前，一个字都不许写盘。
+   S.shelf 初始是空的，而 load() 是异步的（开 IDB、读每本书的头，
+   手机上有几本大书就是一两秒）。这期间 pagehide / visibilitychange 会调 save() ——
+   于是**一个空书架被当成真实状态写进 localStorage**，
+   下次启动 gc 拿它当真相，把 IndexedDB 里的正文一起删掉：书彻底没了。
+   桌面上 load 只要几十毫秒，撞不上；手机上打开就切走、锁屏、来条通知，全中。 */
+var LOADING = true;
 /** 轻状态。★ 存不下要出声 —— 这一条就是老 bug 的正面写法。 */
 function save() {
-  if (RESETTING) return false;
+  if (RESETTING || LOADING) return false;
   syncShelf();
   trimEvents();
   try {
@@ -9137,6 +9178,19 @@ function load() {
       });
     }, Promise.resolve([])).then(function (libs) {
       S.userLibrary = libs;
+
+      /* ★ 先恢复，再清理。顺序反了就是「先把正文删了，再去找它」。
+         存储里有正文、书架上却没有 —— 那是书架索引丢了，不是用户删了书
+         （删书走 delBook，正文和索引一起没）。把它们加回来，
+         最坏只是书架顺序乱了，书还在。 */
+      var rec = MPShelf.recoverOrphans(S.shelf, HEADS, HASTEXT);
+      S.shelf = rec.shelf;
+      if (rec.recovered.length) {
+        recoverNote = '找回了 ' + rec.recovered.length + ' 本书（'
+          + rec.recovered.slice(0, 3).join('、')
+          + (rec.recovered.length > 3 ? ' 等' : '') + '）—— 书架索引丢过一次，正文没事。';
+      }
+
       /* 孤儿清理：书架上没有的正文一律删掉。 */
       var mine = S.shelf.filter(function (x) { return x.mode !== 'library'; })
         .map(function (x) { return x.id; });
@@ -12076,12 +12130,18 @@ applyTheme();
 /* ★ 启动要等 IDB 打开 + 书头载入。load() 现在是 Promise，
    写成 if (load() && S.book) 会恒真（Promise 是 truthy），
    然后拿一个还没装载的 S.book 去渲染 —— 白屏，且不报错。 */
-load().then(function (hasBook) {
+load().catch(function (e) {
+  /* 装载炸了也要让用户能用、能存 —— 否则一个读盘错误会让这台设备从此存不进东西 */
+  try { console.error('load 失败', e); } catch (e2) { /* 没有 console 就算了 */ }
+  return false;
+}).then(function (hasBook) {
+  LOADING = false;
   if (hasBook && S.book) { beginSession({ launch: true }); goto('s-read'); renderChapter(); }
   else if (S.shelf.length) { goto('s-shelf'); }
   else if (!S.profile.onboarded && LIBRARY.length) { openWelcome(); }
   else { goto('s-find'); }
   if (idbWarn) toast(idbWarn);
+  else if (recoverNote) toast(recoverNote);
   else if (migrateNote) toast(migrateNote);
   refreshUsage(true);
 });
